@@ -75,6 +75,12 @@ volatile long g_workBufAllocSize = 0;
 volatile long flaHooksInstalled = 0;
 volatile long csProbeFLAPtrLo = 0;
 volatile long csProbeFLAPtrHi = 0;
+volatile long g_flaCSAcquisitions = 0;
+volatile long nmCloneConstructCount = 0;
+volatile long nmCloneConstructFailCount = 0;
+volatile long nmWorkerMissCount = 0;
+volatile long nmBgMissCount = 0;
+volatile long nmLateHitCount = 0;
 
 std::string   nmDiskCacheDir;
 bool          nmDiskCacheDirChecked = false;
@@ -455,6 +461,25 @@ void LogNavMeshCacheStats(double now)
 	ss << " step=" << step;
 	ss << " busy=" << InterlockedCompareExchange(&workerBusyCount, 0, 0);
 	ss << " flaCS=" << InterlockedCompareExchange(&flaHooksInstalled, 0, 0);
+	ss << " flaAcq=" << InterlockedCompareExchange(&g_flaCSAcquisitions, 0, 0);
+	long cloneOk = InterlockedCompareExchange(&nmCloneConstructCount, 0, 0);
+	long cloneFail = InterlockedCompareExchange(&nmCloneConstructFailCount, 0, 0);
+	if (cloneOk || cloneFail)
+		ss << " clone=" << cloneOk << "/" << (cloneOk + cloneFail);
+
+	long workerMiss = InterlockedCompareExchange(&nmWorkerMissCount, 0, 0);
+	long bgMiss = InterlockedCompareExchange(&nmBgMissCount, 0, 0);
+	if (workerMiss || bgMiss)
+		ss << " miss=w" << workerMiss << "/bg" << bgMiss;
+
+	long lateHits = InterlockedCompareExchange(&nmLateHitCount, 0, 0);
+	if (lateHits)
+		ss << " lateHit=" << lateHits;
+
+	long edgeArmed = InterlockedCompareExchange(&g_edgeProcessArmedCount, 0, 0);
+	long edgeUnarmed = InterlockedCompareExchange(&g_edgeProcessUnarmedCount, 0, 0);
+	if (edgeArmed || edgeUnarmed)
+		ss << " edge=a" << edgeArmed << "/u" << edgeUnarmed;
 
 	LogMsg(ss.str());
 

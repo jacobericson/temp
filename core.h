@@ -26,6 +26,11 @@
 extern LARGE_INTEGER qpcFrequency;
 extern LARGE_INTEGER pluginStartTime;
 
+// Captured on first hook_dispatchJob call (by nm_workers.cpp or nm_workers_stub.cpp).
+// Read by NavMeshCrashHandler in main.cpp to compare against GetCurrentThreadId()
+// at crash time — diagnoses whether processJob crashes on the bg thread or elsewhere.
+extern volatile DWORD g_navMeshBgThreadId;
+
 
 // =========================================================================
 // Timing utilities (inline)
@@ -51,6 +56,9 @@ inline double QPCToMs(const LARGE_INTEGER& start, const LARGE_INTEGER& end)
 std::string GetDLLDirectory();
 void InitLogFile();
 void LogMsg(const std::string& line);
+
+// True on the thread that called InitLogFile (startPlugin -> game main thread).
+bool IsMainThread();
 
 // Verbose logging: active in all dev builds (ZONEOPT_DEBUG defined for
 // both DEV and ZONEONLY_DEV). Compiled out entirely in prod builds.

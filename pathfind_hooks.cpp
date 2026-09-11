@@ -12,12 +12,397 @@
 #include "pathfind_diag.h"
 #include "pathfind_cache.h"
 
+#if PATHFIND_STEP >= 6
+#include "tracking.h"
+#include "navmesh_sched.h"
+#include "grid.h"       // WorldToZoneGrid
+#include <xmmintrin.h>  // __m128
+#endif
+
 #if PATHFIND_STEP >= 1
 
 #if PATHFIND_STEP >= 2
-// BG thread tag: set by hook_csFindPath, read by hook_findPathFull (same thread, sequential)
-static bool currentRequestIsPlayer = false;
+// BG thread tag: set by hook_csFindPath, read by hook_findPathFull.
+// Thread-local: findPathFull has 6 callers; only the csFindPathFallback chain runs
+// on the same contentStream bg thread as csFindPath. Game-internal findPathFull calls
+// on other bg threads would otherwise see stale flags from another thread.
+static __declspec(thread) bool currentRequestIsPlayer = false;
 #endif
+
+
+// =========================================================================
+// STEP 6: HavokCharacter* identification chain + ExitFace decode state
+// =========================================================================
+#if PATHFIND_STEP >= 6
+
+struct ReqCharMapEntry {
+	void*     reqObj;     // NULL = empty slot
+	uintptr_t havokChar;
+	double    insertTime;
+};
+
+static const int REQ_CHAR_MAP_CAPACITY = 128;
+static ReqCharMapEntry reqCharMap[REQ_CHAR_MAP_CAPACITY];
+static CRITICAL_SECTION reqCharMapCS;
+static bool reqCharMapCSInit = false;
+
+// Main thread only: set by hook_requestPath, consumed by hook_pathReqSubmit.
+// Both run sequentially on the main thread in the same call stack -- plain static safe.
+static uintptr_t currentReqChar = 0;
+
+// Bg thread: set by hook_csFindPathFallback, consumed by hook_findPathFull.
+// findPathFull has 6 callers; only the csFindPathFallback chain runs inline on
+// the same thread. Game-internal findPathFull calls on other bg threads would
+// otherwise consume reqCharMap entries intended for the contentStream bg thread.
+// Thread-local storage ensures each thread sees its own NULL unless that thread's
+// own csFindPathFallback set it.
+static __declspec(thread) void* currentBgReq = NULL;
+
+// One-time thread-ID assertion flags (CAS-gated, fire once per hook per session)
+static volatile long threadAssertReqPath  = 0;
+static volatile long threadAssertSubmit   = 0;
+static volatile long threadAssertFallback = 0;
+static volatile long threadAssertFindFull = 0;
+static volatile long resultBufOffsetValidated = 0;
+
+// STEP 6 counters (folded into LogPhase12Stats)
+volatile long exitFaceDecodes          = 0;
+volatile long exitFaceDecodesUnchanged = 0;
+volatile long exitFaceFailures         = 0;
+volatile long exitFaceDecodeErrors     = 0;
+volatile long exitFaceSCRace           = 0;
+volatile long reqCharMapInserts        = 0;
+volatile long reqCharMapLookupHits     = 0;
+volatile long reqCharMapLookupMiss     = 0;
+volatile long reqCharMapOverflows      = 0;
+volatile long reqCharMapHighWater      = 0;
+volatile long reqCharMapDirectPrune    = 0;
+volatile long reqCharMapSuperseded     = 0;
+volatile long npcRequestsSkipped       = 0;
+
+#if PATHFIND_STEP >= 7
+// STEP 7: Formation dedup + preload drain + eviction counters
+volatile long formationDedupHits    = 0;
+volatile long formationPropagations = 0;
+volatile long preloadAheadEnqueued  = 0;
+volatile long watchedEvictions      = 0;
+#endif
+
+#if PATHFIND_STEP >= 9
+// STEP 9 (final): extraction-SEH + stability-gate counters
+volatile long extractionCrashRescue = 0;  // SEH caught AV in contentStreamCallee_0x8869
+volatile long spcStabilityHold      = 0;  // injection skipped because addInstance recent
+volatile long addInstanceHookCalls  = 0;  // sanity: our addInstance hook is firing
+
+// Last addInstance timestamp as raw QPC ticks (atomic on x64 for 8-byte aligned).
+// Written by navmesh bg thread (hook_addInstance), read by contentStream bg thread
+// (hook_findPathFull injection gate).
+volatile LONG64 g_lastAddInstanceQPC = 0;
+#endif
+
+
+void InitReqCharMap()
+{
+	if (reqCharMapCSInit) return;
+	InitializeCriticalSection(&reqCharMapCS);
+	for (int i = 0; i < REQ_CHAR_MAP_CAPACITY; ++i) {
+		reqCharMap[i].reqObj     = NULL;
+		reqCharMap[i].havokChar  = 0;
+		reqCharMap[i].insertTime = 0.0;
+	}
+	reqCharMapCSInit = true;
+}
+
+// Linear scan -- cache-friendly, simpler than open-addressing + tombstones
+// (which break probe chains on delete).
+//
+// Per-havokChar dedup: before inserting a new request, evict any existing
+// entries for the same havokChar. Older in-flight requests are superseded by
+// the new one (AI setDestination replaces path). Only the latest request's
+// ExitFace decode matters (writes to watchedChars[i].exitZonePacked, a single
+// slot). Without this, rapid re-paths or formation bursts leave stale entries
+// competing for map capacity.
+static void ReqCharMapInsert(void* reqObj, uintptr_t havokChar)
+{
+	if (!reqCharMapCSInit || !reqObj || !havokChar) return;
+	EnterCriticalSection(&reqCharMapCS);
+	int firstFree = -1;
+	int oldestIdx = 0;
+	int occupied  = 0;
+	double t = ElapsedSec();
+
+	// Pass 1: evict stale entries for this havokChar (any entry with matching
+	// havokChar but a different reqObj pointer is superseded by the new insert).
+	for (int i = 0; i < REQ_CHAR_MAP_CAPACITY; ++i) {
+		if (reqCharMap[i].reqObj != NULL
+		    && reqCharMap[i].reqObj != reqObj
+		    && reqCharMap[i].havokChar == havokChar) {
+			reqCharMap[i].reqObj     = NULL;
+			reqCharMap[i].havokChar  = 0;
+			reqCharMap[i].insertTime = 0.0;
+			InterlockedIncrement(&reqCharMapSuperseded);
+		}
+	}
+
+	// Pass 2: dedup on reqObj, find firstFree + oldest for placement.
+	for (int i = 0; i < REQ_CHAR_MAP_CAPACITY; ++i) {
+		if (reqCharMap[i].reqObj == reqObj) {
+			// Dedup -- overwrite and exit
+			reqCharMap[i].havokChar  = havokChar;
+			reqCharMap[i].insertTime = t;
+			LeaveCriticalSection(&reqCharMapCS);
+			return;
+		}
+		if (reqCharMap[i].reqObj == NULL && firstFree < 0) firstFree = i;
+		else if (reqCharMap[i].reqObj != NULL) {
+			occupied++;
+			if (reqCharMap[i].insertTime < reqCharMap[oldestIdx].insertTime)
+				oldestIdx = i;
+		}
+	}
+	int slot = (firstFree >= 0) ? firstFree : oldestIdx;
+	if (firstFree < 0) InterlockedIncrement(&reqCharMapOverflows);
+	reqCharMap[slot].reqObj     = reqObj;
+	reqCharMap[slot].havokChar  = havokChar;
+	reqCharMap[slot].insertTime = t;
+	int newOccupied = occupied + (firstFree >= 0 ? 1 : 0);
+	LeaveCriticalSection(&reqCharMapCS);
+	InterlockedIncrement(&reqCharMapInserts);
+	long prev;
+	do {
+		prev = InterlockedCompareExchange(&reqCharMapHighWater, 0, 0);
+		if (newOccupied <= prev) break;
+	} while (InterlockedCompareExchange(&reqCharMapHighWater, newOccupied, prev) != prev);
+}
+
+static uintptr_t ReqCharMapLookupAndDelete(void* reqObj)
+{
+	if (!reqCharMapCSInit || !reqObj) return 0;
+	EnterCriticalSection(&reqCharMapCS);
+	for (int i = 0; i < REQ_CHAR_MAP_CAPACITY; ++i) {
+		if (reqCharMap[i].reqObj == reqObj) {
+			uintptr_t result = reqCharMap[i].havokChar;
+			reqCharMap[i].reqObj     = NULL;
+			reqCharMap[i].havokChar  = 0;
+			reqCharMap[i].insertTime = 0.0;
+			LeaveCriticalSection(&reqCharMapCS);
+			InterlockedIncrement(&reqCharMapLookupHits);
+			return result;
+		}
+	}
+	LeaveCriticalSection(&reqCharMapCS);
+	InterlockedIncrement(&reqCharMapLookupMiss);
+	return 0;
+}
+
+// Silent delete: removes entry if present. Used when csFindPath succeeds
+// (direct path, findPathFull won't fire, so the entry would otherwise orphan).
+// Counted separately from hit/miss since it's a proactive cleanup, not a lookup.
+static void ReqCharMapPrune(void* reqObj)
+{
+	if (!reqCharMapCSInit || !reqObj) return;
+	EnterCriticalSection(&reqCharMapCS);
+	for (int i = 0; i < REQ_CHAR_MAP_CAPACITY; ++i) {
+		if (reqCharMap[i].reqObj == reqObj) {
+			reqCharMap[i].reqObj     = NULL;
+			reqCharMap[i].havokChar  = 0;
+			reqCharMap[i].insertTime = 0.0;
+			LeaveCriticalSection(&reqCharMapCS);
+			InterlockedIncrement(&reqCharMapDirectPrune);
+			return;
+		}
+	}
+	LeaveCriticalSection(&reqCharMapCS);
+}
+
+
+// ExitFace decode + watchedChars[] write. Called on bg thread from
+// hook_findPathFull after orig A* completes successfully.
+//
+// STEP 7 restructure: watched-entry lookup moved to PHASE 1 so formation dedup
+// gate (PHASE 2) can skip the walker when slot cache is fresh. Walker (PHASE 3)
+// only runs on non-dedup path. PHASE 4 writes this entry + preloadAhead.
+// PHASE 5 propagates to slot + formation members (timestamp-compared to avoid
+// regressing followers whose own walk beat this one).
+static void DecodeExitFaceAndUpdate(void* streamingCollection,
+                                    void* searchState,
+                                    void* findPathOutput,
+                                    uintptr_t havokChar)
+{
+	if (!fn_faceToVertices) return;
+
+	// ===== PHASE 1: locate watched entry =====
+	// Snapshot numWatched once to bound scan against concurrent main-thread Remove.
+	int localNum = numWatched;
+	if (localNum > MAX_WATCHED) localNum = MAX_WATCHED;
+
+	int watchedIdx = -1;
+	for (int i = 0; i < localNum; ++i) {
+		uintptr_t cm = watchedChars[i].charMovement;
+		if (!cm) continue;
+		uintptr_t hc = *(uintptr_t*)(cm + OFF_CMOV_HAVOK_CHAR);
+		if (hc == havokChar) { watchedIdx = i; break; }
+	}
+	if (watchedIdx < 0) return;  // char not in watched array (downgrade race)
+
+	double now = ElapsedSec();
+
+#if PATHFIND_STEP >= 7
+	// ===== PHASE 2: formation dedup gate =====
+	int gid = watchedChars[watchedIdx].formationGroupId;  // volatile atomic load
+	if (gid >= 0 && gid < MAX_FORMATION_GROUPS) {
+		double slotTime = spcSlots[gid].formationExitUpdateTime;  // volatile load
+		if (slotTime > 0.0 && now - slotTime < 0.1) {
+			int cachedGX = spcSlots[gid].formationExitGX;
+			int cachedGY = spcSlots[gid].formationExitGY;
+			if (cachedGX >= 0) {
+				// Apply cached decode to this follower; skip the walker.
+				LONG64 newPacked = PackExitZone(cachedGX, cachedGY);
+				LONG64 oldPacked = InterlockedExchange64(
+					(volatile LONG64*)&watchedChars[watchedIdx].exitZonePacked,
+					newPacked);
+				watchedChars[watchedIdx].exitFaceUpdateTime = now;
+
+				// Preload the zone past ExitFace for this follower.
+				int curGX = watchedChars[watchedIdx].currentZoneX;
+				int curGY = watchedChars[watchedIdx].currentZoneY;
+				int dirX = (cachedGX > curGX) ? 1 : ((cachedGX < curGX) ? -1 : 0);
+				int dirY = (cachedGY > curGY) ? 1 : ((cachedGY < curGY) ? -1 : 0);
+				if (dirX != 0 || dirY != 0) {
+					watchedChars[watchedIdx].preloadAheadGX = cachedGX + dirX;
+					watchedChars[watchedIdx].preloadAheadGY = cachedGY + dirY;
+					watchedChars[watchedIdx].preloadAheadUpdateTime = now;
+				}
+
+				InterlockedIncrement(&formationDedupHits);
+				if (oldPacked != newPacked)
+					InterlockedExchange(&g_reprioRequested, 1);
+				return;
+			}
+		}
+	}
+#endif
+
+	// ===== PHASE 3: walker (STEP 6 decode logic) =====
+	unsigned char status = *(unsigned char*)((uintptr_t)findPathOutput + 60);
+	if (status != 1) {
+		InterlockedIncrement(&exitFaceFailures);
+		return;
+	}
+
+	void* edgeData = *(void**)((uintptr_t)findPathOutput + 16);
+	int   edgeCnt  = *(int*)((uintptr_t)findPathOutput + 24);
+	if (!edgeData || edgeCnt <= 0 || edgeCnt > 200000) {
+		InterlockedIncrement(&exitFaceFailures);
+		return;
+	}
+
+	// Start face section comes from FindPathInput (searchState+48 = m_startFaceKey).
+	// The edges array contains faces traversed THROUGH (not including start face).
+	unsigned int startFaceKey = *(unsigned int*)((uintptr_t)searchState + 48);
+	unsigned int startSection = startFaceKey >> 22;
+
+	int   scCount = *(int*)((uintptr_t)streamingCollection + OFF_SC_INSTANCES_COUNT);
+	void* scBase  = *(void**)((uintptr_t)streamingCollection + OFF_SC_INSTANCES_BASE);
+	if (!scBase || scCount <= 0) {
+		InterlockedIncrement(&exitFaceDecodeErrors);
+		return;
+	}
+
+	unsigned int* edges = (unsigned int*)edgeData;
+	unsigned int exitKey = 0;
+	for (int e = 0; e < edgeCnt; ++e) {
+		if ((edges[e] >> 22) != startSection) {
+			exitKey = edges[e];
+			break;
+		}
+	}
+	if (exitKey == 0) {
+		InterlockedIncrement(&exitFaceFailures);  // single-zone path
+		return;
+	}
+
+	unsigned int sectionId = exitKey >> 22;
+	unsigned int faceIdx   = exitKey & 0x3FFFFF;
+	if ((int)sectionId >= scCount) {
+		InterlockedIncrement(&exitFaceDecodeErrors);
+		return;
+	}
+
+	// Race guard: scInstancesCount changed mid-walk = section table mutated.
+	int scCount2 = *(int*)((uintptr_t)streamingCollection + OFF_SC_INSTANCES_COUNT);
+	if (scCount2 != scCount) {
+		InterlockedIncrement(&exitFaceSCRace);
+		return;
+	}
+
+	void* instance = *(void**)((char*)scBase + INSTANCEINFO_SIZE * sectionId);
+	if (!instance) {
+		InterlockedIncrement(&exitFaceDecodeErrors);
+		return;
+	}
+
+	// Resolve face -> two edge endpoints (worldspace __m128). Scratch arg is
+	// uninitialized qword in observed call sites -- pass 0 explicitly.
+	__m128 vA, vB;
+	fn_faceToVertices(instance, (int)faceIdx, &vA, &vB, (uintptr_t)0);
+
+	// Edge midpoint -- close enough for zone-grid mapping (zones are huge vs faces).
+	float cx = (vA.m128_f32[0] + vB.m128_f32[0]) * 0.5f;
+	float cz = (vA.m128_f32[2] + vB.m128_f32[2]) * 0.5f;
+
+	int gx, gy;
+	if (!WorldToZoneGrid(cx, cz, &gx, &gy)) {
+		InterlockedIncrement(&exitFaceDecodeErrors);
+		return;
+	}
+
+	// ===== PHASE 4: write this entry + preloadAhead =====
+	LONG64 newPacked = PackExitZone(gx, gy);
+	LONG64 oldPacked = InterlockedExchange64(
+		(volatile LONG64*)&watchedChars[watchedIdx].exitZonePacked, newPacked);
+	watchedChars[watchedIdx].exitFaceUpdateTime = now;
+	InterlockedIncrement(&exitFaceDecodes);
+
+#if PATHFIND_STEP >= 7
+	{
+		int curGX = watchedChars[watchedIdx].currentZoneX;
+		int curGY = watchedChars[watchedIdx].currentZoneY;
+		int dirX = (gx > curGX) ? 1 : ((gx < curGX) ? -1 : 0);
+		int dirY = (gy > curGY) ? 1 : ((gy < curGY) ? -1 : 0);
+		if (dirX != 0 || dirY != 0) {
+			watchedChars[watchedIdx].preloadAheadGX = gx + dirX;
+			watchedChars[watchedIdx].preloadAheadGY = gy + dirY;
+			watchedChars[watchedIdx].preloadAheadUpdateTime = now;
+		}
+	}
+
+	// ===== PHASE 5: formation propagation =====
+	if (gid >= 0 && gid < MAX_FORMATION_GROUPS) {
+		// Write leader's decode to slot cache. Followers will pick it up via
+		// PHASE 2 dedup gate when their own findPathFull runs. We do NOT
+		// propagate to other watched chars' fields here — that extends the
+		// bg-thread work window enough to race with navmesh workers'
+		// addInstance/SortedArray__grow, which reallocates m_instances and
+		// causes game code to crash reading stale InstanceInfo slots.
+		// The dedup gate is equivalent functionally (followers get the data
+		// when their request arrives), without the extra bg write pressure.
+		spcSlots[gid].formationExitGX         = gx;
+		spcSlots[gid].formationExitGY         = gy;
+		spcSlots[gid].formationExitUpdateTime = now;
+	}
+#endif
+
+	// Set reprio flag if this char's exit zone changed. STEP 7 squad cache
+	// injection writes same packed to N members; only value-change fires the flag.
+	if (oldPacked != newPacked) {
+		InterlockedExchange(&g_reprioRequested, 1);
+	} else {
+		InterlockedIncrement(&exitFaceDecodesUnchanged);
+	}
+}
+
+#endif // PATHFIND_STEP >= 6
 
 
 // =========================================================================
@@ -38,6 +423,16 @@ char hook_csFindPath(void* manager, unsigned int startFaceKey, void* startPos,
 		InterlockedIncrement(&diagPrimarySuccess);
 	else
 		InterlockedIncrement(&diagPrimaryFail);
+
+#if PATHFIND_STEP >= 6
+	// Direct-path success: findPathFull won't run for this request, so any
+	// reqCharMap entry for it would orphan. Prune now. Same resultBuf->requestObj
+	// recovery as hook_csFindPathFallback (dispatcher passes req+128 as resultBuf).
+	if (result && resultBuf) {
+		void* reqObj = (void*)((char*)resultBuf - OFF_REQ_RESULTBUF_SLOT);
+		ReqCharMapPrune(reqObj);
+	}
+#endif
 
 #if PATHFIND_STEP >= 2
 	// Player request tagging: boosted requests (pri 50+) sort to top of queue.
@@ -123,7 +518,11 @@ char hook_csCheckFaceConn(void* manager, unsigned int startFace, unsigned int de
 #endif // PATHFIND_STEP >= 4
 
 #if PATHFIND_STEP >= 3
-	// Bypass the cluster graph connectivity pre-check entirely
+	// Bypass the cluster graph connectivity pre-check entirely.
+	// NPCs going through cluster-graph traversal hit sub_140DA4470 which derefs
+	// m_instances[sec]+16 and races with addInstance (observed crash at 0xDA44D5).
+	// Unconditional bypass closes that vector. Cluster graph is an optimization
+	// (A* would reach the same conclusion) so correctness is preserved.
 	return 1;
 #else
 	// Steps 1-2: call original, count failures
@@ -322,7 +721,7 @@ void hook_findPathFull(void* streamingCollection, void* searchState, void* findP
 							slot.numIter   = *(int*)(fpo + 48);
 							slot.goalIdx   = *(int*)(fpo + 52);
 							slot.pathCost  = *(float*)(fpo + 56);
-							slot.cachedSCSize = *(int*)((uintptr_t)streamingCollection + OFF_SC_INSTANCES_SIZE);
+							slot.cachedSCSize = *(int*)((uintptr_t)streamingCollection + OFF_SC_INSTANCES_COUNT);
 							slot.state = 2;
 							InterlockedIncrement(&spcDiagLeaderOK);
 						}
@@ -354,7 +753,7 @@ void hook_findPathFull(void* streamingCollection, void* searchState, void* findP
 			// CACHE_ACTIVE or REPATH_INJECT: inject cached result
 			if ((slot.state == 2 || slot.state == 6) && slot.edgeData)
 			{
-				int curSCSize = *(int*)((uintptr_t)streamingCollection + OFF_SC_INSTANCES_SIZE);
+				int curSCSize = *(int*)((uintptr_t)streamingCollection + OFF_SC_INSTANCES_COUNT);
 				if (curSCSize < slot.cachedSCSize)
 				{
 					InterlockedIncrement(&p12DiagSCGuardSkips);
@@ -366,6 +765,32 @@ void hook_findPathFull(void* streamingCollection, void* searchState, void* findP
 					}
 					goto default_astar;
 				}
+
+#if PATHFIND_STEP >= 9
+				// Stability gate: if addInstance ran in the last 500ms, the
+				// streaming collection is actively mutating and our cached
+				// section references may race with in-flight evictions during
+				// the post-return extraction. Skip injection, let the game's
+				// real A* run against current m_instances (safe by construction).
+				{
+					LONG64 lastAddQPC = InterlockedCompareExchange64(&g_lastAddInstanceQPC, 0, 0);
+					if (lastAddQPC != 0) {
+						LARGE_INTEGER nowLi;
+						QueryPerformanceCounter(&nowLi);
+						double deltaSec = (double)(nowLi.QuadPart - lastAddQPC)
+						                  / (double)qpcFrequency.QuadPart;
+						if (deltaSec < 0.5) {
+							InterlockedIncrement(&spcStabilityHold);
+							if (slot.state == 2 || slot.state == 6) {
+								SpcFreeSlot(taggedSlot);
+								slot.state = 4;
+								slot.goalFaceKey = 0;
+							}
+							goto default_astar;
+						}
+					}
+				}
+#endif
 
 				int byteCount = slot.edgeCount * 4;
 				void* edgeCopy = HavokTlsAlloc((size_t)byteCount);
@@ -438,7 +863,7 @@ void hook_findPathFull(void* streamingCollection, void* searchState, void* findP
 							slot.numIter   = *(int*)(fpo + 48);
 							slot.goalIdx   = *(int*)(fpo + 52);
 							slot.pathCost  = *(float*)(fpo + 56);
-							slot.cachedSCSize = *(int*)((uintptr_t)streamingCollection + OFF_SC_INSTANCES_SIZE);
+							slot.cachedSCSize = *(int*)((uintptr_t)streamingCollection + OFF_SC_INSTANCES_COUNT);
 							slot.state = 6;
 							slot.burstInjected = 0;
 							slot.lastInjectionTime = now;
@@ -540,6 +965,26 @@ diag_count:
 		}
 #endif
 	}
+
+#if PATHFIND_STEP >= 6
+	// ExitFace decode: dispatch to helper if we have a reqCharMap match.
+	// currentBgReq is set by hook_csFindPathFallback (called immediately above us
+	// on the same bg thread, same call stack -- findPathFull is called inline from
+	// findPathFallback). Cleared by hook_csFindPathFallback after we return.
+	if (currentBgReq) {
+		uintptr_t havokChar = ReqCharMapLookupAndDelete(currentBgReq);
+		if (havokChar) {
+			DecodeExitFaceAndUpdate(streamingCollection, searchState,
+			                        findPathOutput, havokChar);
+		}
+	}
+
+	if (!InterlockedCompareExchange(&threadAssertFindFull, 1, 0)) {
+		std::ostringstream ss;
+		ss << "[ZoneOpt] PATHFIND_STEP=6 hook_findPathFull tid=" << GetCurrentThreadId();
+		LogMsg(ss.str());
+	}
+#endif
 }
 
 
@@ -558,6 +1003,23 @@ void hook_requestPath(void* havokChar, float* destination, int priority)
 		InterlockedIncrement(&diagPlayerRequests);
 	else
 		InterlockedIncrement(&diagNPCRequests);
+
+#if PATHFIND_STEP >= 6
+	// NPC filter: priority>=2 = player-owned (per setDestination_Vec3 contract).
+	// NPCs would flood the 64-entry map and never match a watched char anyway.
+	if (priority >= 2) {
+		currentReqChar = (uintptr_t)havokChar;
+	} else {
+		currentReqChar = 0;
+		InterlockedIncrement(&npcRequestsSkipped);
+	}
+
+	if (!InterlockedCompareExchange(&threadAssertReqPath, 1, 0)) {
+		std::ostringstream ss;
+		ss << "[ZoneOpt] PATHFIND_STEP=6 hook_requestPath tid=" << GetCurrentThreadId();
+		LogMsg(ss.str());
+	}
+#endif
 
 #if PATHFIND_STEP >= 2
 	squadBoostTier = 0;
@@ -649,6 +1111,10 @@ matched:
 	squadBoostTier = 0;
 	squadBoostGroupIdx = -1;
 #endif
+
+#if PATHFIND_STEP >= 6
+	currentReqChar = 0;
+#endif
 }
 
 #endif // PATHFIND_STEP >= 1
@@ -676,6 +1142,28 @@ void hook_pathReqSubmit(void* sectionMgr, void* requestObj, bool highPriority)
 		}
 	}
 
+#if PATHFIND_STEP >= 6
+	if (currentReqChar && requestObj) {
+		ReqCharMapInsert(requestObj, currentReqChar);
+	}
+
+	if (!InterlockedCompareExchange(&threadAssertSubmit, 1, 0)) {
+		std::ostringstream ss;
+		ss << "[ZoneOpt] PATHFIND_STEP=6 hook_pathReqSubmit tid=" << GetCurrentThreadId()
+		   << " requestObj=" << requestObj;
+		LogMsg(ss.str());
+	}
+
+	// One-shot offset cross-reference: emit requestObj+128 so hook_csFindPathFallback's
+	// recoveredReq=Y line can be cross-checked against requestObj=R from this log.
+	if (requestObj && !InterlockedCompareExchange(&resultBufOffsetValidated, 1, 0)) {
+		std::ostringstream ss;
+		ss << "[ZoneOpt] PATHFIND_STEP=6 first request: requestObj=" << requestObj
+		   << " resultBufSlot=" << (void*)((char*)requestObj + OFF_REQ_RESULTBUF_SLOT);
+		LogMsg(ss.str());
+	}
+#endif
+
 	squadBoostTier = 0;
 	squadBoostGroupIdx = -1;
 }
@@ -694,6 +1182,26 @@ char hook_csFindPathFallback(void* manager, unsigned int startFaceKey, void* sta
                               unsigned int destFaceKey, void* destPos, float radius,
                               float param6, char param7, void* resultBuf)
 {
+#if PATHFIND_STEP >= 6
+	// Recover request pointer via dispatcher offset.
+	// SectionManager::contentStream (0x3AE350) calls findPathFallback with &v80[8]
+	// (= req+128). PathRequest__ctor inits req+128 to NULL (buffer slot).
+	if (resultBuf) {
+		currentBgReq = (void*)((char*)resultBuf - OFF_REQ_RESULTBUF_SLOT);
+	} else {
+		currentBgReq = NULL;
+	}
+
+	if (!InterlockedCompareExchange(&threadAssertFallback, 1, 0)) {
+		std::ostringstream ss;
+		ss << "[ZoneOpt] PATHFIND_STEP=6 hook_csFindPathFallback tid="
+		   << GetCurrentThreadId()
+		   << " resultBuf=" << resultBuf
+		   << " recoveredReq=" << currentBgReq;
+		LogMsg(ss.str());
+	}
+#endif
+
 	spcFallbackTag = 0;
 
 	if (squadPathCacheEnabled)
@@ -735,10 +1243,61 @@ char hook_csFindPathFallback(void* manager, unsigned int startFaceKey, void* sta
 	                                       destFaceKey, destPos, radius,
 	                                       param6, param7, resultBuf);
 	spcFallbackTag = 0;
+#if PATHFIND_STEP >= 6
+	currentBgReq = NULL;
+#endif
 	return result;
 }
 
 #endif // PATHFIND_STEP >= 4
+
+
+// =========================================================================
+// STEP 9 hooks: extraction SEH wrap + addInstance timestamp gate
+// =========================================================================
+#if PATHFIND_STEP >= 9
+
+// Hook 7: hkaiStreamingCollection::addInstance (navmesh bg thread).
+// Wraps orig and stamps g_lastAddInstanceQPC so our cache injection can detect
+// whether streaming state was recently mutated. No blocking, no locks.
+void hook_addInstance(void* collection, __int64 sectionData,
+                      __int64 param3, __int64 param4, int param5)
+{
+	orig_addInstance(collection, sectionData, param3, param4, param5);
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	InterlockedExchange64(&g_lastAddInstanceQPC, now.QuadPart);
+	InterlockedIncrement(&addInstanceHookCalls);
+}
+
+// Hook 8: Havok::contentStreamCallee_0x8869 (contentStream bg thread).
+// SEH wraps the path-result extraction loop. On AV (from the race between
+// our cached edges + game's addInstance evicting their sections), rolls back
+// resultBuf[2] to its pre-call value so the partial writes into resultBuf's
+// tail are logically erased. Game treats as "no new edges produced" -> clean
+// no-path -> character re-paths on next tick instead of bugging out with
+// corrupted mid-loop data.
+//
+// NOTE: SEH + /EHsc requires no C++ destructors in scope. This function uses
+// only POD types + Win32 atomics, so it's safe.
+unsigned __int64 hook_contentStreamCallee0x8869(void* manager,
+                                                 unsigned int faceKey,
+                                                 void* searchOutput,
+                                                 unsigned int* resultBuf)
+{
+	unsigned int origCount = resultBuf ? resultBuf[2] : 0;
+	unsigned __int64 result = origCount;
+	__try {
+		result = orig_contentStreamCallee0x8869(manager, faceKey, searchOutput, resultBuf);
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		InterlockedIncrement(&extractionCrashRescue);
+		if (resultBuf) resultBuf[2] = origCount;
+		result = origCount;
+	}
+	return result;
+}
+
+#endif // PATHFIND_STEP >= 9 (final)
 
 
 #endif // PATHFIND_STEP >= 1

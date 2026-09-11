@@ -46,6 +46,7 @@ struct FormationGroup {
 	double createdTime;
 	bool active;
 	bool gathered;
+	double lastReissueTime;   // FormationReissueTravel cooldown (0 = never)
 };
 
 struct SquadPathSignalEntry {
@@ -84,6 +85,17 @@ bool ApplyScatterPatch();
 void CreateFormationGroup(const float* dest, uintptr_t* chars, int charCount);
 void PollFormationGroups();
 void ClearFormationGroups();
+
+// Island re-issue helpers (islands.cpp, ISLAND_STEP >= 3). Main thread only.
+// Slot of the active formation group containing `character` (-1 = none).
+int       FormationSlotForCharacter(uintptr_t character);
+// First member of the group that is still in the player squad (0 = none).
+uintptr_t FormationFirstAliveMember(int slot);
+// Re-dispatch the travel order (grp.dest) to every alive member, once per
+// boundary move: returns false while the per-group cooldown is active.
+// Members whose last requested destination already equals grp.dest get a
+// 3-unit offset so CharMovement::setDestination does not drop the order.
+bool      FormationReissueTravel(int slot, double now);
 
 #endif // !ZONEOPT_ZONEONLY
 

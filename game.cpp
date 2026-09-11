@@ -26,6 +26,7 @@ void*           g_handleTable    = NULL;
 pathBuilderInit_t      fn_pathBuilderInit     = NULL;
 pathBuilderFinalize_t  fn_pathBuilderFinalize = NULL;
 readerUnlock_t         fn_readerUnlock        = NULL;
+queueLockInit_t        fn_queueLockInit       = NULL;
 
 navMeshCtor_t        fn_navMeshCtor         = NULL;
 settingsCtor_t       fn_settingsCtor        = NULL;
@@ -47,8 +48,12 @@ havokCtxCleanup_t    fn_havokCtxCleanup      = NULL;
 #ifndef ZONEOPT_ZONEONLY
 charMovSetDest_t     fn_charMovSetDest       = NULL;
 #endif
+lektorReserve_t      fn_lektorReserve        = NULL;
 #if PATHFIND_STEP >= 1
 enqueuePathReq_t     fn_enqueuePathReq       = NULL;
+#endif
+#if PATHFIND_STEP >= 6
+faceToVertices_t     fn_faceToVertices       = NULL;
 #endif
 
 
@@ -63,6 +68,8 @@ addOrderSelected_t      orig_addOrderSelected      = NULL;
 dispatchJob_t           orig_dispatchJob           = NULL;
 nmResultPopulate_t      orig_nmResultPopulate      = NULL;
 realGenerate_t          orig_realGenerate          = NULL;
+isInIsland_t            orig_isInIsland            = NULL;
+getIsland_t             orig_getIsland             = NULL;
 #if PATHFIND_STEP >= 1
 csFindPath_t            orig_csFindPath            = NULL;
 csCheckFaceConn_t       orig_csCheckFaceConn       = NULL;
@@ -70,6 +77,10 @@ findPathFull_t          orig_findPathFull          = NULL;
 requestPath_t           orig_requestPath           = NULL;
 pathReqSubmit_t         orig_pathReqSubmit         = NULL;
 csFindPathFallback_t    orig_csFindPathFallback    = NULL;
+#endif
+#if PATHFIND_STEP >= 9
+contentStreamCallee0x8869_t orig_contentStreamCallee0x8869 = NULL;
+addInstance_t               orig_addInstance               = NULL;
 #endif
 
 
@@ -100,6 +111,7 @@ void InitGameBindings(uintptr_t base)
 	fn_pathBuilderInit       = (pathBuilderInit_t)      GameAddr(RVA_PATH_BUILDER_INIT);
 	fn_pathBuilderFinalize   = (pathBuilderFinalize_t)  GameAddr(RVA_PATH_BUILDER_FINALIZE);
 	fn_readerUnlock          = (readerUnlock_t)         GameAddr(RVA_READER_UNLOCK);
+	fn_queueLockInit         = (queueLockInit_t)        GameAddr(RVA_QUEUE_LOCK_INIT);
 
 	// NavMesh active cache
 	fn_navMeshCtor           = (navMeshCtor_t)           GameAddr(RVA_NAVMESH_CTOR);
@@ -120,10 +132,17 @@ void InitGameBindings(uintptr_t base)
 	fn_havokCleanup          = (havokCleanup_t)          GameAddr(RVA_HAVOK_CLEANUP);
 	fn_havokCtxCleanup       = (havokCtxCleanup_t)       GameAddr(RVA_HAVOK_CTX_CLEANUP);
 
+	// Island routing
+	fn_lektorReserve         = (lektorReserve_t)         GameAddr(RVA_LEKTOR_RESERVE);
+
 #ifndef ZONEOPT_ZONEONLY
 	fn_charMovSetDest        = (charMovSetDest_t)        GameAddr(RVA_CHARMOV_SET_DEST);
 	fn_enqueuePathReq        = (enqueuePathReq_t)        GameAddr(RVA_ENQUEUE_PATH_REQ);
 #elif PATHFIND_STEP >= 1
 	fn_enqueuePathReq        = (enqueuePathReq_t)        GameAddr(RVA_ENQUEUE_PATH_REQ);
+#endif
+
+#if PATHFIND_STEP >= 6
+	fn_faceToVertices        = (faceToVertices_t)        GameAddr(RVA_FACE_TO_VERTICES);
 #endif
 }

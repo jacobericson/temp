@@ -13,6 +13,17 @@ static HANDLE navMeshThreadHandle  = NULL;
 static int    savedThreadPriority  = THREAD_PRIORITY_NORMAL;
 
 
+#if PATHFIND_STEP >= 5
+// =========================================================================
+// Reprio flag + counters (declared in navmesh_sched.h)
+// =========================================================================
+volatile long g_reprioRequested = 0;
+volatile long reprioFlagFires   = 0;
+volatile long reprioTimerFires  = 0;
+volatile long reprioOrderFires  = 0;
+#endif
+
+
 // =========================================================================
 // Thread priority boost (NMG background thread only)
 // =========================================================================
@@ -61,11 +72,90 @@ void RestoreNavMeshThread()
 //   Tier 4: Other preloaded zones (stationary characters, behind)
 //   Tier 5: Everything else (game's own jobs, unknown zones)
 
-static int ComputeZonePriority(int gridX, int gridY,
-                               int camGridX, int camGridY,
-                               const SchedMoverInfo* movers, int moverCount,
-                               const SchedZoneInfo* preloaded, int preloadedCount)
+int ComputeZonePriority(int gridX, int gridY,
+                        int camGridX, int camGridY,
+                        const SchedMoverInfo* movers, int moverCount,
+                        const SchedZoneInfo* preloaded, int preloadedCount)
 {
+#if PATHFIND_STEP >= 5
+	// T1: mover with hasMoveOrder=true at this exact zone OR at decoded ExitFace zone.
+	for (int w = 0; w < moverCount; ++w)
+	{
+		if (!movers[w].hasMoveOrder) continue;
+		if (movers[w].currentX == gridX && movers[w].currentY == gridY)
+			return 1;
+#if PATHFIND_STEP >= 6
+		// ExitFace match: A*-derived next-zone-out, written by hook_findPathFull.
+		// Sentinel guard: INT_MIN means no decode yet (skip match).
+		if (movers[w].exitZoneGX > -2000000000 &&
+		    movers[w].exitZoneGX == gridX && movers[w].exitZoneGY == gridY)
+			return 1;
+#endif
+	}
+
+	// T2: camera 2x2 pause grid. SMALL_DX/SMALL_DY = {0,1}x{0,1} (positive offsets).
+	if (camGridX >= 0 && camGridY >= 0)
+	{
+		int dx = gridX - camGridX;
+		int dy = gridY - camGridY;
+		if (dx >= 0 && dx <= 1 && dy >= 0 && dy <= 1)
+			return 2;
+	}
+
+	// T3: any mover at this zone (chars with hasMoveOrder=true returned T1 above,
+	//     so only baseline movers reach here on the direct-match path)
+	//     OR >=3 movers within a 2x2 cluster containing this zone.
+	bool isT3 = false;
+	for (int w = 0; w < moverCount; ++w)
+	{
+		if (movers[w].currentX == gridX && movers[w].currentY == gridY)
+		{ isT3 = true; break; }
+	}
+	if (!isT3)
+	{
+		// Density expansion: iterate the 4 unique 2x2 anchors that contain
+		// (gridX, gridY) -- i.e. anchorX in {gridX-1, gridX}, anchorY in {gridY-1, gridY}.
+		// SMALL_DX/SMALL_DY = {0,1}x{0,1}, so (gridX - SMALL_DX[sd], gridY - SMALL_DY[sd])
+		// produces exactly those 4 anchors.
+		for (int sd = 0; sd < 4 && !isT3; ++sd)
+		{
+			int anchorX = gridX - SMALL_DX[sd];
+			int anchorY = gridY - SMALL_DY[sd];
+			int n = 0;
+			for (int w = 0; w < moverCount; ++w)
+			{
+				int mx = movers[w].currentX, my = movers[w].currentY;
+				if (mx >= anchorX && mx <= anchorX + 1 &&
+				    my >= anchorY && my <= anchorY + 1)
+					n++;
+			}
+			if (n >= 3) isT3 = true;
+		}
+	}
+	if (isT3) return 3;
+
+#if PATHFIND_STEP >= 8
+	// STEP 8 swap: preloaded zones are our "stale preload regret" and rank
+	// BELOW game-initiated jobs. Game jobs are for zones the state machine
+	// decided it needs — they deserve to outrank our pre-warm speculation.
+	for (int i = 0; i < preloadedCount; ++i)
+	{
+		if (preloaded[i].gridX == gridX && preloaded[i].gridY == gridY)
+			return 5;   // stale preload -> lowest priority
+	}
+	return 4;           // game/default -> above stale preloads
+#else
+	// T4: in preloadedZones[] (didn't qualify for T1-T3)
+	for (int i = 0; i < preloadedCount; ++i)
+	{
+		if (preloaded[i].gridX == gridX && preloaded[i].gridY == gridY)
+			return 4;
+	}
+
+	// T5: default
+	return 5;
+#endif
+#else
 	// --- Tier 1: Camera zones (3x3 around camera) ---
 	if (camGridX >= 0 && camGridY >= 0)
 	{
@@ -126,6 +216,7 @@ static int ComputeZonePriority(int gridX, int gridY,
 	}
 
 	return 5;
+#endif
 }
 
 
@@ -222,10 +313,18 @@ void PrioritizeNavMeshQueue(int camGridX, int camGridY,
 	// Release lock
 	fn_readerUnlock((void*)(navMeshGen + 152));
 
+#if PATHFIND_STEP >= 5
+	if (totalJobs > 0)
+#else
 	if (tierCounts[0] + tierCounts[1] + tierCounts[2] > 0)
+#endif
 	{
 		std::ostringstream ss;
+#if PATHFIND_STEP >= 8
+		ss << "[ZoneOpt] NavMesh queue prioritized (T4=game/T5=stale):"
+#else
 		ss << "[ZoneOpt] NavMesh queue prioritized:"
+#endif
 		   << " T1=" << tierCounts[0] << " T2=" << tierCounts[1]
 		   << " T3=" << tierCounts[2] << " T4=" << tierCounts[3]
 		   << " T5=" << tierCounts[4];

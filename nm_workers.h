@@ -25,7 +25,6 @@ void hook_realGenerate(void* workBuffer, void* localData, void* hkaiNavMesh, int
 void ProcessNavMeshJob(void* realNMG, void* workNMG, uintptr_t job, int jobType);
 DWORD WINAPI NavMeshWorkerProc(LPVOID param);
 void CreateNavMeshWorkers();
-void InitScratchTLS();
 
 
 #endif // KENSHI_ZONE_OPT_NM_WORKERS_H

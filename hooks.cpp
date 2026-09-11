@@ -6,6 +6,7 @@
 #include "formation.h"
 #include "pathfinding.h"
 #include "navmesh_sched.h"
+#include "islands.h"
 
 // Transition state (defined here, declared in transition.h)
 bool           isTransitionActive   = false;
@@ -19,31 +20,54 @@ static bool prioritizedThisTransition = false;
 // NavMesh scheduling helpers (builds context from preload/tracking state)
 // =========================================================================
 
-static void CallPrioritizeNavMeshQueue()
+void BuildSchedContext(SchedContext* ctx)
 {
 	// Resolve camera: use transition target if active, else lastCameraGX/GY
-	int prioCamX = lastCameraGX, prioCamY = lastCameraGY;
+	ctx->camX = lastCameraGX;
+	ctx->camY = lastCameraGY;
 	if (isTransitionActive && g_cachedZoneMgr)
 	{
 		void* tz = *(void**)((uintptr_t)g_cachedZoneMgr + OFF_ZM_CURRENT_ZONE);
-		if (tz) { prioCamX = GetZoneGridX(tz); prioCamY = GetZoneGridY(tz); }
+		if (tz) { ctx->camX = GetZoneGridX(tz); ctx->camY = GetZoneGridY(tz); }
 	}
 
-	SchedMoverInfo movers[MAX_WATCHED];
-	for (int i = 0; i < numWatched; ++i)
+	int moverCount = numWatched;
+	if (moverCount > MAX_WATCHED) moverCount = MAX_WATCHED;
+	for (int i = 0; i < moverCount; ++i)
 	{
-		movers[i].currentX = watchedChars[i].currentZoneX;
-		movers[i].currentY = watchedChars[i].currentZoneY;
-		movers[i].destX    = watchedChars[i].destZoneX;
-		movers[i].destY    = watchedChars[i].destZoneY;
+		ctx->movers[i].currentX = watchedChars[i].currentZoneX;
+		ctx->movers[i].currentY = watchedChars[i].currentZoneY;
+		ctx->movers[i].destX    = watchedChars[i].destZoneX;
+		ctx->movers[i].destY    = watchedChars[i].destZoneY;
+#if PATHFIND_STEP >= 5
+		ctx->movers[i].hasMoveOrder = watchedChars[i].hasMoveOrder;
+#endif
+#if PATHFIND_STEP >= 6
+		// Atomic 64-bit read of packed (gx, gy). Bg thread (findPathFull) writes
+		// via InterlockedExchange64 on the same field — no torn pair.
+		LONG64 packed = InterlockedCompareExchange64(
+			(volatile LONG64*)&watchedChars[i].exitZonePacked, 0, 0);
+		UnpackExitZone(packed, &ctx->movers[i].exitZoneGX, &ctx->movers[i].exitZoneGY);
+#endif
 	}
-	SchedZoneInfo zones[MAX_PRELOADED];
-	for (int i = 0; i < numPreloaded; ++i)
+	ctx->moverCount = moverCount;
+
+	int zoneCount = numPreloaded;
+	if (zoneCount > MAX_PRELOADED) zoneCount = MAX_PRELOADED;
+	for (int i = 0; i < zoneCount; ++i)
 	{
-		zones[i].gridX = preloadedZones[i].gridX;
-		zones[i].gridY = preloadedZones[i].gridY;
+		ctx->zones[i].gridX = preloadedZones[i].gridX;
+		ctx->zones[i].gridY = preloadedZones[i].gridY;
 	}
-	PrioritizeNavMeshQueue(prioCamX, prioCamY, movers, numWatched, zones, numPreloaded);
+	ctx->zoneCount = zoneCount;
+}
+
+static void CallPrioritizeNavMeshQueue()
+{
+	static SchedContext ctx;   // main thread only; kept off the stack (~1.3 KB)
+	BuildSchedContext(&ctx);
+	PrioritizeNavMeshQueue(ctx.camX, ctx.camY, ctx.movers, ctx.moverCount,
+	                       ctx.zones, ctx.zoneCount);
 }
 
 #if NMCACHE_STEP >= 4
@@ -178,26 +202,36 @@ void hook_showLoadingMessage(void* thisPtr, bool on)
 // Our hook: if original returns 0 and only navmesh conditions (2-4) block,
 // return 1 anyway. The navmesh generator continues in the background.
 
+// Threading: isContentPending is also reached through isZoneStillLoading
+// (0x3AC810) from CharMovement::setDestination (AI evaluation), the
+// spawn-check thread and character creation. The return value is computed
+// identically on every thread; the side effects (queue reprioritization,
+// deferred-frame accounting, LogDebug's ostringstream) run only on the main
+// thread. Per-thread call/not-ready counters feed the Islands diagnostic line.
+
 bool hook_isContentPending(void* manager, void* zonePos)
 {
+	bool onMainThread = IsMainThread();
+
 	// Prioritize navmesh queue once per transition, at start of state 4.
 	// By state 4, processState3 has finished registerZoneSections ->
 	// contentStream has submitted all navmesh jobs for this transition.
 	// Reordering now promotes the transition zone's jobs to the front.
-	if (isTransitionActive && !prioritizedThisTransition)
+	if (onMainThread && isTransitionActive && !prioritizedThisTransition)
 	{
 		CallPrioritizeNavMeshQueue();
 		prioritizedThisTransition = true;
 	}
 
 	bool result = orig_isContentPending(manager, zonePos);
+	int sectionCount = *(int*)((uintptr_t)manager + 632);
+	IslandCountReadiness(!result, !result && sectionCount > 0);
 	if (result)
 		return true;
 
 	if (!deferralEnabled)
 		return false;
 
-	int sectionCount = *(int*)((uintptr_t)manager + 632);
 	if (sectionCount > 0)
 		return false;
 
@@ -206,6 +240,9 @@ bool hook_isContentPending(void* manager, void* zonePos)
 	// Micro-transitions (platoon activation bumps state 0->1 without
 	// showLoadingMessage): prevents NavMeshGenerator idle stall from
 	// causing state 4 pause. NPCs use fallback pathfinding briefly.
+	if (!onMainThread)
+		return true;
+
 	if (isTransitionActive)
 		deferredFrameCount++;
 	else
@@ -298,6 +335,8 @@ void hook_addOrderSelected(void* thisPI, void* destIndoors, int task,
 						if (collectedCount < MAX_FORMATION_MEMBERS)
 							collectedChars[collectedCount++] = character;
 #endif
+						// Island re-issue tracker (ISLAND_STEP >= 3; stub otherwise)
+						IslandNoteOrder(character, location);
 
 						// Phase 3 preload tracking: cross-zone movers
 						if (preloadEnabled && movementAwareEnabled && haveDest)
@@ -314,7 +353,11 @@ void hook_addOrderSelected(void* thisPI, void* destIndoors, int task,
 									if (charMov)
 									{
 										if (AddWatchedCharacter(character, charMov,
-										                        destGX, destGY, curGX, curGY))
+										                        destGX, destGY, curGX, curGY
+#if PATHFIND_STEP >= 5
+										                        , /*hasMoveOrder=*/true
+#endif
+										                        ))
 										{
 											charsAdded++;
 										}
@@ -401,6 +444,17 @@ void hook_addOrderSelected(void* thisPI, void* destIndoors, int task,
 	}
 
 	orig_addOrderSelected(thisPI, destIndoors, task, subject, shift, addDontClear, location);
+
+#if PATHFIND_STEP >= 5
+	// Immediate reprio: the player just added one or more T1 destinations.
+	// Existing queued jobs at those zones float to top now. New requests from
+	// the AI task system land on later ticks and ride the backstop.
+	if (charsAdded > 0)
+	{
+		CallPrioritizeNavMeshQueue();
+		InterlockedIncrement(&reprioOrderFires);
+	}
+#endif
 }
 
 
@@ -473,11 +527,70 @@ void hook_updateCameraZone(void* zoneMgr, void* cameraPos)
 	// Ensures character path zones and camera zones are always
 	// processed first by the NavMesh background thread.
 	static double lastReprioritizeTime = 0.0;
+#if PATHFIND_STEP >= 5
+	{
+		// Flag-driven (set by bg thread STEP 6+) takes precedence; otherwise
+		// fall back to cfg_reprioritizeInterval (default 1.0s, INI-tunable).
+		long flag = InterlockedExchange(&g_reprioRequested, 0);
+		if (flag != 0)
+		{
+			CallPrioritizeNavMeshQueue();
+			lastReprioritizeTime = now;
+			InterlockedIncrement(&reprioFlagFires);
+		}
+		else if (now - lastReprioritizeTime > cfg_reprioritizeInterval)
+		{
+			CallPrioritizeNavMeshQueue();
+			lastReprioritizeTime = now;
+			InterlockedIncrement(&reprioTimerFires);
+		}
+	}
+#else
 	if (now - lastReprioritizeTime > 3.0 && (numWatched > 0 || pendingCount > 0))
 	{
 		CallPrioritizeNavMeshQueue();
 		lastReprioritizeTime = now;
 	}
+#endif
+
+#if PATHFIND_STEP >= 7
+	// STEP 7: 1Hz drain of preloadAhead zones stashed by bg-thread findPathFull.
+	// Atomic read-and-clear via InterlockedExchange avoids races with concurrent
+	// bg decode. Clears to PRELOAD_AHEAD_NONE (=-1) so next decode re-fires.
+	{
+		static double lastPreloadAheadDrain = 0.0;
+		if (now - lastPreloadAheadDrain > 1.0)
+		{
+			int drained = 0;
+			for (int i = 0; i < numWatched; ++i)
+			{
+				long gx = InterlockedExchange((volatile long*)&watchedChars[i].preloadAheadGX,
+				                               PRELOAD_AHEAD_NONE);
+				long gy = InterlockedExchange((volatile long*)&watchedChars[i].preloadAheadGY,
+				                               PRELOAD_AHEAD_NONE);
+				if (gx == PRELOAD_AHEAD_NONE || gy == PRELOAD_AHEAD_NONE) continue;
+				if (gx < 0 || gx > ZONE_GRID_MAX || gy < 0 || gy > ZONE_GRID_MAX) continue;
+
+				if (EnqueueCharacterZone((int)gx, (int)gy))
+				{
+					InterlockedIncrement(&preloadAheadEnqueued);
+					drained++;
+				}
+			}
+			lastPreloadAheadDrain = now;
+			if (drained > 0)
+			{
+				std::ostringstream ss;
+				ss << "[ZoneOpt] PreloadAhead drain: " << drained << " zones";
+				LogDebug(ss.str());
+			}
+		}
+	}
+#endif
+
+	// Island routing overlay: Set B signature, component rebuild, parked-squad
+	// re-issue, diagnostics (main thread; hooks read the published snapshot)
+	IslandTick(zoneMgr, now);
 
 	// NavMesh cache diagnostic: report background thread job count
 	LogNavMeshCacheStats(now);
@@ -586,7 +699,9 @@ void hook_updateCameraZone(void* zoneMgr, void* cameraPos)
 					LogDebug(ss.str());
 
 					EnqueueCameraGrid(targetX, targetY);
+#if PATHFIND_STEP < 8
 					EnqueueAheadZones(targetX, targetY, currentX, currentY, OWNER_CAMERA);
+#endif
 				}
 			}
 		}

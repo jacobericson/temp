@@ -4,6 +4,10 @@
 
 #include "formation.h"
 #include "pathfinding.h"
+#if PATHFIND_STEP >= 7
+#include "tracking.h"        // watchedChars[] + gid helpers
+#include "pathfind_cache.h"  // spcSlots[] formation dedup cache
+#endif
 
 // State needed by pathfinding priority boost (PATHFIND_STEP >= 2)
 #if !defined(ZONEOPT_ZONEONLY) || PATHFIND_STEP >= 2
@@ -175,6 +179,14 @@ void ClearFormationGroups()
 		formationGroups[i].active = false;
 		formationGroups[i].gathered = false;
 		formationGroups[i].count = 0;
+		formationGroups[i].lastReissueTime = 0.0;
+#if PATHFIND_STEP >= 7
+		// Defensive: reset slot dedup cache. No watched chars exist on fresh
+		// game load so ClearFormationGroupIdForSlot is not needed here.
+		spcSlots[i].formationExitGX         = -1;
+		spcSlots[i].formationExitGY         = -1;
+		spcSlots[i].formationExitUpdateTime = 0.0;
+#endif
 	}
 }
 
@@ -286,6 +298,7 @@ void CreateFormationGroup(const float* dest, uintptr_t* chars, int charCount)
 	grp.createdTime = now;
 	grp.active = true;
 	grp.gathered = false;
+	grp.lastReissueTime = 0.0;
 
 	// Capture leader position as the gather point
 	grp.startX = *(float*)(chars[0] + OFF_CHAR_POS_X);
@@ -335,6 +348,21 @@ void CreateFormationGroup(const float* dest, uintptr_t* chars, int charCount)
 		}
 		grp.count++;
 	}
+
+#if PATHFIND_STEP >= 7
+	// Set formationGroupId on each watched entry matching a member. Bg-thread
+	// (findPathFull) reads this for dedup gate; volatile int = atomic on x86-64.
+	{
+		uintptr_t memberChars[MAX_FORMATION_MEMBERS_LIMIT];
+		int mc = 0;
+		for (int m = 0; m < grp.count && mc < MAX_FORMATION_MEMBERS_LIMIT; ++m)
+		{
+			if (grp.members[m].character)
+				memberChars[mc++] = grp.members[m].character;
+		}
+		SetFormationGroupIdOnMembers(slot, memberChars, mc);
+	}
+#endif
 
 	// Pre-gathered: skip the gather phase entirely. orig_addOrderSelected
 	// (called after this returns) issues the move orders directly — no
@@ -408,6 +436,14 @@ void PollFormationGroups()
 				   << std::fixed << std::setprecision(0) << FORMATION_TIMEOUT << "s";
 				LogMsg(ss.str());
 			}
+#if PATHFIND_STEP >= 7
+			ClearFormationGroupIdForSlot(g);
+			// Clear slot dedup cache so a reused group slot doesn't see stale
+			// fresh-timestamp and mis-dedupe to previous group's ExitFace.
+			spcSlots[g].formationExitUpdateTime = 0.0;
+			spcSlots[g].formationExitGX         = -1;
+			spcSlots[g].formationExitGY         = -1;
+#endif
 			grp.active = false;
 			continue;
 		}
@@ -426,6 +462,12 @@ void PollFormationGroups()
 			}
 			if (!stillGrouped)
 			{
+#if PATHFIND_STEP >= 7
+				ClearFormationGroupIdForSlot(g);
+				spcSlots[g].formationExitUpdateTime = 0.0;
+				spcSlots[g].formationExitGX         = -1;
+				spcSlots[g].formationExitGY         = -1;
+#endif
 				grp.active = false;
 				continue;
 			}
@@ -634,9 +676,134 @@ void PollFormationGroups()
 			ss << "[ZoneOpt] Formation group complete: "
 			   << aliveCount << " alive, " << doneCount << "/" << grp.count << " done";
 			LogMsg(ss.str());
+#if PATHFIND_STEP >= 7
+			ClearFormationGroupIdForSlot(g);
+			spcSlots[g].formationExitUpdateTime = 0.0;
+			spcSlots[g].formationExitGX         = -1;
+			spcSlots[g].formationExitGY         = -1;
+#endif
 			grp.active = false;
 		}
 	}
+}
+
+
+// =========================================================================
+// Island re-issue helpers (islands.cpp, ISLAND_STEP >= 3). Main thread only.
+// =========================================================================
+
+int FormationSlotForCharacter(uintptr_t character)
+{
+	if (!character) return -1;
+	for (int g = 0; g < MAX_FORMATION_GROUPS; ++g)
+	{
+		// Active groups only; a still-gathering group is reported too so its
+		// members are never re-issued individually (FormationReissueTravel
+		// declines until the group has gathered).
+		const FormationGroup& grp = formationGroups[g];
+		if (!grp.active) continue;
+		for (int m = 0; m < grp.count; ++m)
+			if (grp.members[m].character == character)
+				return g;
+	}
+	return -1;
+}
+
+uintptr_t FormationFirstAliveMember(int slot)
+{
+	if (slot < 0 || slot >= MAX_FORMATION_GROUPS) return 0;
+	const FormationGroup& grp = formationGroups[slot];
+	if (!grp.active) return 0;
+
+	uintptr_t playerIntf = *(uintptr_t*)(gameBase + RVA_GLOBAL_PLAYER);
+	unsigned int scCount = 0;
+	uintptr_t* scStuff = NULL;
+	if (playerIntf)
+	{
+		scCount = GetPlayerCharCount(playerIntf);
+		scStuff = GetPlayerCharStuff(playerIntf);
+	}
+	if (!scStuff || scCount == 0 || scCount > 200) return 0;
+
+	for (int m = 0; m < grp.count; ++m)
+	{
+		uintptr_t ch = grp.members[m].character;
+		if (!ch) continue;
+		for (unsigned int j = 0; j < scCount; ++j)
+			if (scStuff[j] == ch)
+				return ch;
+	}
+	return 0;
+}
+
+bool FormationReissueTravel(int slot, double now)
+{
+	if (slot < 0 || slot >= MAX_FORMATION_GROUPS) return false;
+	FormationGroup& grp = formationGroups[slot];
+	if (!grp.active || !grp.gathered) return false;
+	if (grp.lastReissueTime > 0.0 && now - grp.lastReissueTime < 2.0) return false;
+
+	uintptr_t playerIntf = *(uintptr_t*)(gameBase + RVA_GLOBAL_PLAYER);
+	unsigned int scCount = 0;
+	uintptr_t* scStuff = NULL;
+	if (playerIntf)
+	{
+		scCount = GetPlayerCharCount(playerIntf);
+		scStuff = GetPlayerCharStuff(playerIntf);
+	}
+	if (!scStuff || scCount == 0 || scCount > 200) return false;
+
+	// Same dispatch as the gather->travel transition in PollFormationGroups.
+	int sent = 0;
+	int nudged = 0;
+	for (int m = 0; m < grp.count; ++m)
+	{
+		FormationMember& mem = grp.members[m];
+		if (!mem.character) continue;
+
+		bool alive = false;
+		for (unsigned int j = 0; j < scCount; ++j)
+			if (scStuff[j] == mem.character) { alive = true; break; }
+		if (!alive) { mem.character = 0; continue; }
+
+		uintptr_t charVtable = *(uintptr_t*)mem.character;
+		if (!charVtable) continue;
+		typedef void (*moveOrderFn_t)(uintptr_t, void*, void*, const float*);
+		moveOrderFn_t fn_moveOrder = (moveOrderFn_t)(*(uintptr_t*)(charVtable + 0x318));
+		if (!fn_moveOrder) continue;
+
+		float destPos[3] = { grp.destX, grp.destY, grp.destZ };
+
+		// CharMovement::setDestination drops a new order within 2 units of the
+		// last requested destination while it is routing to an island edge.
+		// Every member received the exact grp.dest (scatter patch), so nudge.
+		uintptr_t cm = *(uintptr_t*)(mem.character + OFF_CHAR_MOVEMENT);
+		if (cm)
+		{
+			float lx = *(float*)(cm + OFF_CMOV_LAST_DEST);
+			float lz = *(float*)(cm + OFF_CMOV_LAST_DEST + 8);
+			float ddx = lx - grp.destX, ddz = lz - grp.destZ;
+			if (ddx * ddx + ddz * ddz < 4.0f)
+			{
+				destPos[0] += 3.0f;
+				nudged++;
+			}
+		}
+
+		fn_moveOrder(mem.character, NULL, NULL, destPos);
+		sent++;
+	}
+
+	if (sent == 0) return false;
+	grp.lastReissueTime = now;
+
+	std::ostringstream ss;
+	ss << "[ZoneOpt] Formation reissue: group slot " << slot
+	   << " " << sent << " members (" << nudged << " nudged)"
+	   << " dest=(" << std::fixed << std::setprecision(0)
+	   << grp.destX << "," << grp.destZ << ")";
+	LogMsg(ss.str());
+	return true;
 }
 
 #endif // !ZONEOPT_ZONEONLY

@@ -20,8 +20,12 @@ bool groupCohesionEnabled  = true;
 #endif
 #if PATHFIND_STEP >= 1
 bool pathfindDiagEnabled   = true;
-bool squadPathCacheEnabled = true;
+bool squadPathCacheEnabled = false;  // Report 4 CTD: injection is unsafe. INI squadPathCache=true is for Phase 16 staging only.
 #endif
+#if PATHFIND_STEP >= 2
+bool stuckRetryEnabled     = false;  // Log stalled movement without replacing orders by default.
+#endif
+bool islandFixEnabled      = true;   // islandFix=false keeps the island hooks passing through (A/B control)
 
 
 // =========================================================================
@@ -49,8 +53,14 @@ int    cfg_navmeshWorkerCount    = 3;
 
 // Hook orchestration
 double cfg_camLogInterval        = 10.0;
-double cfg_reprioritizeInterval  = 3.0;
+double cfg_reprioritizeInterval  = 1.0;  // STEP 5: flag-then-backstop cadence (was 3.0)
 double cfg_evictInterval         = 2.0;
+
+// Island routing
+int    cfg_islandModRadius       = 2;
+#ifdef ZONEOPT_DEBUG
+double cfg_islandTestPromoteDelay = 0.0;
+#endif
 
 // Capacity
 int    cfg_maxPreloaded          = 45;
@@ -218,6 +228,10 @@ void LoadConfig(const std::string& dllDir)
 		else if (key == "pathfindDiag")   { bool b; if (ParseBool(val, &b)) { pathfindDiagEnabled = b; matched = true; } }
 		else if (key == "squadPathCache") { bool b; if (ParseBool(val, &b)) { squadPathCacheEnabled = b; matched = true; } }
 #endif
+#if PATHFIND_STEP >= 2
+		else if (key == "stuckRetry")     { bool b; if (ParseBool(val, &b)) { stuckRetryEnabled = b; matched = true; } }
+#endif
+		else if (key == "islandFix")      { bool b; if (ParseBool(val, &b)) { islandFixEnabled = b; matched = true; } }
 
 		// --- Tuning parameters ---
 		else if (key == "preloadThreshold")
@@ -246,6 +260,12 @@ void LoadConfig(const std::string& dllDir)
 			{ double v; if (ParseDouble(val, &v)) { cfg_reprioritizeInterval = v; matched = true; } }
 		else if (key == "evictInterval")
 			{ double v; if (ParseDouble(val, &v)) { cfg_evictInterval = v; matched = true; } }
+		else if (key == "islandModRadius")
+			{ int v; if (ParseInt(val, &v)) { cfg_islandModRadius = v; matched = true; } }
+#ifdef ZONEOPT_DEBUG
+		else if (key == "islandTestPromoteDelay")
+			{ double v; if (ParseDouble(val, &v)) { cfg_islandTestPromoteDelay = v; matched = true; } }
+#endif
 
 		// --- Capacity (requires restart) ---
 		else if (key == "maxPreloaded")
@@ -289,6 +309,10 @@ void LoadConfig(const std::string& dllDir)
 	cfg_camLogInterval        = ClampDouble("camLogInterval", cfg_camLogInterval, 1.0, 300.0);
 	cfg_reprioritizeInterval  = ClampDouble("reprioritizeInterval", cfg_reprioritizeInterval, 1.0, 30.0);
 	cfg_evictInterval         = ClampDouble("evictInterval", cfg_evictInterval, 0.5, 30.0);
+	cfg_islandModRadius       = ClampInt("islandModRadius", cfg_islandModRadius, 0, 8);
+#ifdef ZONEOPT_DEBUG
+	cfg_islandTestPromoteDelay = ClampDouble("islandTestPromoteDelay", cfg_islandTestPromoteDelay, 0.0, 60.0);
+#endif
 
 	cfg_maxPreloaded          = ClampInt("maxPreloaded", cfg_maxPreloaded, 9, 128);
 	cfg_maxWatched            = ClampInt("maxWatched", cfg_maxWatched, 4, 128);

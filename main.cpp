@@ -3,6 +3,11 @@
 #include "hooks.h"
 #include "formation.h"
 #include "pathfinding.h"
+#include "islands.h"
+#if PATHFIND_STEP >= 5
+#include "tracking.h"
+#include "navmesh_sched.h"
+#endif
 
 // InitLogFile is declared in core.h
 
@@ -67,7 +72,7 @@ static LONG WINAPI NavMeshCrashHandler(PEXCEPTION_POINTERS pExInfo)
 				"  RAX=0x%p RBX=0x%p RCX=0x%p RDX=0x%p\r\n"
 				"  R8=0x%p  R9=0x%p  R10=0x%p R11=0x%p\r\n"
 				"  RSP=0x%p RBP=0x%p RSI=0x%p RDI=0x%p\r\n"
-				"  busy=%ld slabHook=%ld/%ld\r\n",
+				"  busy=%ld slabHook=%ld/%ld crashTid=%lu bgTid=%lu\r\n",
 				code, (void*)addr, (unsigned long long)rva,
 				(void*)pExInfo->ContextRecord->Rax, (void*)pExInfo->ContextRecord->Rbx,
 				(void*)pExInfo->ContextRecord->Rcx, (void*)pExInfo->ContextRecord->Rdx,
@@ -77,20 +82,25 @@ static LONG WINAPI NavMeshCrashHandler(PEXCEPTION_POINTERS pExInfo)
 				(void*)pExInfo->ContextRecord->Rsi, (void*)pExInfo->ContextRecord->Rdi,
 				InterlockedCompareExchange(&workerBusyCount, 0, 0),
 				InterlockedCompareExchange(&g_slabAllocHits, 0, 0),
-				InterlockedCompareExchange(&g_slabAllocWorkerHits, 0, 0));
+				InterlockedCompareExchange(&g_slabAllocWorkerHits, 0, 0),
+				GetCurrentThreadId(),
+				(unsigned long)g_navMeshBgThreadId);
 #else
 			sprintf_s(buf, sizeof(buf),
 				"[ZoneOpt] CRASH: code=0x%08X addr=0x%p rva=0x%llX\r\n"
 				"  RAX=0x%p RBX=0x%p RCX=0x%p RDX=0x%p\r\n"
 				"  R8=0x%p  R9=0x%p  R10=0x%p R11=0x%p\r\n"
-				"  RSP=0x%p RBP=0x%p RSI=0x%p RDI=0x%p\r\n",
+				"  RSP=0x%p RBP=0x%p RSI=0x%p RDI=0x%p\r\n"
+				"  crashTid=%lu bgTid=%lu\r\n",
 				code, (void*)addr, (unsigned long long)rva,
 				(void*)pExInfo->ContextRecord->Rax, (void*)pExInfo->ContextRecord->Rbx,
 				(void*)pExInfo->ContextRecord->Rcx, (void*)pExInfo->ContextRecord->Rdx,
 				(void*)pExInfo->ContextRecord->R8, (void*)pExInfo->ContextRecord->R9,
 				(void*)pExInfo->ContextRecord->R10, (void*)pExInfo->ContextRecord->R11,
 				(void*)pExInfo->ContextRecord->Rsp, (void*)pExInfo->ContextRecord->Rbp,
-				(void*)pExInfo->ContextRecord->Rsi, (void*)pExInfo->ContextRecord->Rdi);
+				(void*)pExInfo->ContextRecord->Rsi, (void*)pExInfo->ContextRecord->Rdi,
+				GetCurrentThreadId(),
+				(unsigned long)g_navMeshBgThreadId);
 #endif
 
 			// Append to log file
@@ -134,15 +144,31 @@ __declspec(dllexport) void startPlugin()
 	InitLogFile();
 	LoadConfig(GetDLLDirectory());
 
+#if PATHFIND_STEP >= 5
+	// Cross-TU ABI sanity: WatchedCharacter / SchedMoverInfo layouts depend on
+	// PATHFIND_STEP. If a future build ships TUs compiled with mismatched
+	// PATHFIND_STEP values, reads/writes land on different field offsets and
+	// silently corrupt. VS2010 v100 has no static_assert; emit at startup so
+	// any drift surfaces in the log immediately.
+	{
+		std::ostringstream ss;
+		ss << "[ZoneOpt] sizeof(WatchedCharacter)=" << sizeof(WatchedCharacter)
+		   << " sizeof(SchedMoverInfo)=" << sizeof(SchedMoverInfo)
+		   << " (PATHFIND_STEP=" << PATHFIND_STEP << ")";
+		LogMsg(ss.str());
+	}
+#endif
+
 	// Initialize all function pointers from game RVAs
 	InitGameBindings(gameBase);
+
+#if PATHFIND_STEP >= 6
+	InitReqCharMap();
+#endif
 
 #if NMCACHE_STEP >= 1
 	g_jobEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 	InitNavMeshCacheCS();
-#endif
-#if NMCACHE_STEP >= 4
-	InitScratchTLS();
 #endif
 
 	ClearPreloadState();
@@ -187,6 +213,40 @@ __declspec(dllexport) void startPlugin()
 		else
 			ErrorLog("[ZoneOpt] FAILED to hook addOrderSelectedCharacters");
 	}
+
+#if ISLAND_STEP >= 1
+	// Phase 15: island routing overlay. Both hooks or neither go live —
+	// either one alone leaves a stall symptom unfixed or parks a squad at the
+	// destination zone's boundary. islandFix=false keeps them passing through.
+	if (preloadEnabled)
+	{
+		totalHooks += 2;
+		int islandInstalled = 0;
+
+		if (KenshiLib::SUCCESS == KenshiLib::AddHook(
+				GameAddr(RVA_ISINISLAND_IMPL),
+				hook_isInIsland, &orig_isInIsland))
+			{ installed++; islandInstalled++; }
+		else
+			ErrorLog("[ZoneOpt] FAILED to hook ZoneMap::isInIsland");
+
+		if (KenshiLib::SUCCESS == KenshiLib::AddHook(
+				GameAddr(RVA_GETISLAND_IMPL),
+				hook_getIsland, &orig_getIsland))
+			{ installed++; islandInstalled++; }
+		else
+			ErrorLog("[ZoneOpt] FAILED to hook ZoneManager::getIsland");
+
+		IslandSetHooksInstalled(islandInstalled == 2);
+
+		std::ostringstream is;
+		is << "[ZoneOpt] Island routing: "
+		   << (islandInstalled == 2 ? "both hooks installed" : "PARTIAL install, overlay disabled")
+		   << (IslandHooksLive() ? " (live)" : " (pass-through)")
+		   << " step=" << ISLAND_STEP;
+		LogMsg(is.str());
+	}
+#endif // ISLAND_STEP >= 1
 
 #if NMCACHE_STEP >= 1
 	if (cachingEnabled)
@@ -343,6 +403,34 @@ __declspec(dllexport) void startPlugin()
 	}
 #endif // PATHFIND_STEP >= 4
 
+#if PATHFIND_STEP >= 9
+	// Step 9 (final): extraction-SEH (contentStreamCallee_0x8869) + addInstance timestamp hook
+	if (pathfindDiagEnabled)
+	{
+		totalHooks += 2;
+
+		if (KenshiLib::SUCCESS == KenshiLib::AddHook(
+				GameAddr(RVA_CONTENT_STREAM_CALLEE_0X8869),
+				hook_contentStreamCallee0x8869, &orig_contentStreamCallee0x8869))
+		{
+			installed++;
+			LogMsg("[ZoneOpt] Pathfinding step 9: contentStreamCallee_0x8869 SEH hook installed");
+		}
+		else
+			ErrorLog("[ZoneOpt] FAILED to hook contentStreamCallee_0x8869");
+
+		if (KenshiLib::SUCCESS == KenshiLib::AddHook(
+				GameAddr(RVA_ADD_INSTANCE),
+				hook_addInstance, &orig_addInstance))
+		{
+			installed++;
+			LogMsg("[ZoneOpt] Pathfinding step 9: addInstance timestamp hook installed");
+		}
+		else
+			ErrorLog("[ZoneOpt] FAILED to hook hkaiStreamingCollection::addInstance");
+	}
+#endif // PATHFIND_STEP >= 9
+
 	std::ostringstream msg;
 	msg << "[ZoneOpt] Initialized - " << installed << "/" << totalHooks << " hooks installed"
 	    << ", deferral=" << (deferralEnabled ? "ON" : "OFF")
@@ -358,6 +446,12 @@ __declspec(dllexport) void startPlugin()
 	    << ", squadCache=" << (squadPathCacheEnabled ? "ON" : "OFF")
 	    << ", pathStep=" << PATHFIND_STEP
 #endif
+#if PATHFIND_STEP >= 2
+	    << ", stuckRetry=" << (stuckRetryEnabled ? "ON" : "OFF")
+#endif
+	    << ", islandFix=" << (islandFixEnabled ? "ON" : "OFF")
+	    << ", islandStep=" << ISLAND_STEP
+	    << ", islandModRadius=" << cfg_islandModRadius
 #ifdef ZONEOPT_ZONEONLY
 	    << " [ZONE-ONLY BUILD]"
 #endif

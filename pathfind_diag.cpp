@@ -3,6 +3,7 @@
 
 #include "pathfind_diag.h"
 #include "grid.h"
+#include "islands.h"
 
 #if PATHFIND_STEP >= 1
 
@@ -607,7 +608,32 @@ void PollPlayerMovementState(double now)
 			   << " pathOk=" << (pathOk ? 1 : 0)
 			   << " pathFail=" << (pathFailed ? 1 : 0)
 			   << " destReach=" << (destReached ? 1 : 0)
-			   << " destIsPos=" << (destIsPos ? 1 : 0);
+			   << " destIsPos=" << (destIsPos ? 1 : 0)
+			   << " retryEnabled=" << (stuckRetryEnabled ? 1 : 0);
+#if ISLAND_STEP >= 1
+			// Island routing view of the park (see islands.h / island_routing.md):
+			//   wp   = pathDestination, edge = movingToEdge/edgeCounter
+			//   self = liveComp(char zone), xd = |pos - raw emulated crossing|
+			//   next = zone beyond the crossing: c=liveComp l=label ld=+176 a=+177
+			IslandStuckInfo isi;
+			if (g_cachedZoneMgr
+			    && IslandDescribeStuck(g_cachedZoneMgr, charMov, posX, posZ,
+			                           tp.destX, tp.destZ, &isi))
+			{
+				ss << " wp=(" << isi.wpX << "," << isi.wpZ << ")"
+				   << " edge=" << isi.movingToEdge << "/" << isi.edgeCounter
+				   << " self=" << isi.selfComp;
+				if (isi.haveCrossing)
+					ss << " xd=" << isi.xd;
+				else
+					ss << " xd=none";
+				ss << " next=(" << isi.nextGX << "," << isi.nextGY << ")"
+				   << " c=" << isi.nextComp
+				   << " l=" << isi.nextLabel
+				   << " ld=" << isi.nextLoading
+				   << " a=" << isi.nextAccess;
+			}
+#endif
 			LogMsg(ss.str());
 		}
 
@@ -623,7 +649,11 @@ void PollPlayerMovementState(double now)
 			continue;
 		}
 
-		// === DEADLOCK CONFIRMED — move toward zone exit at decreasing % ===
+		// Keep diagnostics active without issuing replacement movement orders.
+		if (!stuckRetryEnabled)
+			continue;
+
+		// Optional recovery: move toward zone exit at decreasing percentages.
 		uintptr_t charVtable = *(uintptr_t*)tp.character;
 		if (!charVtable)
 			continue;
@@ -667,9 +697,9 @@ void PollPlayerMovementState(double now)
 		float destVec[3] = { targetX, pos[1], targetZ };
 
 		fn_moveOrder(tp.character, NULL, NULL, destVec);
+		tp.retryCount++;
 
 		tp.lastRetryTime = now;
-		tp.retryCount++;
 		tp.zeroVelocityPolls = 0;
 
 		{
@@ -680,6 +710,7 @@ void PollPlayerMovementState(double now)
 			   << " pos=(" << posX << "," << posZ << ")"
 			   << " target=(" << targetX << "," << targetZ << ")"
 			   << " dest=(" << tp.destX << "," << tp.destZ << ")"
+			   << " retryEnabled=" << (stuckRetryEnabled ? 1 : 0)
 			   << " char=" << (void*)tp.character;
 			LogMsg(ss.str());
 		}

@@ -38,4 +38,46 @@ char hook_csFindPathFallback(void* manager, unsigned int startFaceKey, void* sta
 void LogSquadPathCacheStats(double now);
 #endif
 
+// Step 6+: ExitFace decode + reqCharMap identification chain
+#if PATHFIND_STEP >= 6
+void InitReqCharMap();
+
+extern volatile long exitFaceDecodes;
+extern volatile long exitFaceDecodesUnchanged;
+extern volatile long exitFaceFailures;
+extern volatile long exitFaceDecodeErrors;
+extern volatile long exitFaceSCRace;
+extern volatile long reqCharMapInserts;
+extern volatile long reqCharMapLookupHits;
+extern volatile long reqCharMapLookupMiss;
+extern volatile long reqCharMapOverflows;
+extern volatile long reqCharMapHighWater;
+extern volatile long reqCharMapDirectPrune;
+extern volatile long reqCharMapSuperseded;
+extern volatile long npcRequestsSkipped;
+#endif
+
+// Step 7+: Formation dedup + ExitFace preload drain + eviction counters
+#if PATHFIND_STEP >= 7
+extern volatile long formationDedupHits;
+extern volatile long formationPropagations;
+extern volatile long preloadAheadEnqueued;
+extern volatile long watchedEvictions;
+#endif
+
+// Step 9+: Extraction-SEH + stability-gate (final)
+#if PATHFIND_STEP >= 9
+void hook_addInstance(void* collection, __int64 sectionData,
+                      __int64 param3, __int64 param4, int param5);
+unsigned __int64 hook_contentStreamCallee0x8869(void* manager,
+                                                 unsigned int faceKey,
+                                                 void* searchOutput,
+                                                 unsigned int* resultBuf);
+
+extern volatile long extractionCrashRescue;
+extern volatile long spcStabilityHold;
+extern volatile long addInstanceHookCalls;
+extern volatile LONG64 g_lastAddInstanceQPC;
+#endif
+
 #endif // KENSHI_ZONE_OPT_PATHFINDING_H

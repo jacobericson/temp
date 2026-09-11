@@ -14,12 +14,15 @@
 #endif
 #endif
 
-// Incremental navmesh cache enablement. Override via /DNMCACHE_STEP=N.
-// Each step implies all previous. 0=none, 1=L1 cache, 2=+L2 disk, 3=+quality,
-// 4=+workers (BLOCKED: CRT heap corruption), 5=+populate hook.
-// Production default: 3 (step 4+ blocked — see worker_clone_investigation.md).
+// NavMesh cache feature gate. Each step implies all previous. Production ships at 4.
+//   0 = no cache
+//   1 = L1 in-memory ring buffer (deep-copy + reconstruct)
+//   2 = +L2 disk cache (flat binary files, order-independent building hash)
+//   3 = +generation quality tuning
+//   4 = +worker pool (Stage 4c: workers parallelize L1/L2 HITs, steal MISSes under processJobCS)
+// Retained as a compile-time gate so earlier steps can be rebuilt for regression bisection.
 #ifndef NMCACHE_STEP
-  #define NMCACHE_STEP 3
+  #define NMCACHE_STEP 4
 #endif
 
 // Incremental pathfinding feature enablement. Set via /DPATHFIND_STEP=N on cl line.
@@ -28,6 +31,17 @@
 // Temporary gate — removed after validation.
 #ifndef PATHFIND_STEP
   #define PATHFIND_STEP 0
+#endif
+
+// Island routing staging gate (Phase 15). Set via /DISLAND_STEP=N on the cl line
+// (build_opt_step4_dev.bat). Step 0 (readiness-gate side effects on the main
+// thread only + per-thread counters) is always compiled.
+//   1 = builder + snapshot + marks + emulation + PLAYER STUCK fields; hooks pass through
+//   2 = both hooks live (the fix; islandFix INI key can turn it off at runtime)
+//   3 = parked-squad re-issue + tier-ordered registration/promotion
+// Temporary gate — removed after validation (the fix then ships in all 6 variants).
+#ifndef ISLAND_STEP
+  #define ISLAND_STEP 0
 #endif
 
 
@@ -47,6 +61,10 @@ extern bool groupCohesionEnabled;
 extern bool pathfindDiagEnabled;
 extern bool squadPathCacheEnabled;
 #endif
+#if PATHFIND_STEP >= 2
+extern bool stuckRetryEnabled;
+#endif
+extern bool islandFixEnabled;            // islandFix: overlay answers the island hooks (ISLAND_STEP >= 2)
 
 
 // =========================================================================
@@ -91,6 +109,13 @@ extern int    cfg_navmeshWorkerCount;    // worker thread count (capped at NAVME
 extern double cfg_camLogInterval;        // debug camera log interval
 extern double cfg_reprioritizeInterval;  // seconds between navmesh queue reprioritization
 extern double cfg_evictInterval;         // seconds between stale zone eviction checks
+
+// Island routing
+extern int    cfg_islandModRadius;       // Chebyshev radius (zones) around camera/player chars
+                                         // within which marked mod zones stay eligible; 0 = unlimited
+#ifdef ZONEOPT_DEBUG
+extern double cfg_islandTestPromoteDelay; // DEV: hold promotion N seconds after registration (forces the race)
+#endif
 
 // Capacity (set once at startup, treated as immutable)
 extern int    cfg_maxPreloaded;
@@ -140,6 +165,10 @@ inline bool ApplyScatterPatch() { return false; }
 inline void CreateFormationGroup(const float*, uintptr_t*, int) {}
 inline void PollFormationGroups() {}
 inline void ClearFormationGroups() {}
+// Island re-issue helpers (formation groups do not exist in ZONEONLY)
+inline int       FormationSlotForCharacter(uintptr_t) { return -1; }
+inline uintptr_t FormationFirstAliveMember(int) { return 0; }
+inline bool      FormationReissueTravel(int, double) { return false; }
 #endif // ZONEOPT_ZONEONLY
 
 // Pathfinding stubs: disabled features get no-ops (works in both ZONEONLY and FULL)
@@ -164,11 +193,6 @@ inline void LogNavMeshCacheStats(double) {}
 void ClearNavMeshCache();
 void InitNavMeshCacheCS();
 void LogNavMeshCacheStats(double now);
-#endif
-#if NMCACHE_STEP < 4
-inline void InitScratchTLS() {}
-#else
-void InitScratchTLS();
 #endif
 
 

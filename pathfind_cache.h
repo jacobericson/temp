@@ -59,6 +59,14 @@ struct SquadPathCacheSlot {
 	int    cachedSCSize;     // streaming collection size at cache time
 	double lastInjectionTime;
 	int    burstInjected;
+#if PATHFIND_STEP >= 7
+	// Leader's decoded ExitFace zone, written by hook_findPathFull on bg thread.
+	// Read by bg thread for formation dedup gate + main thread for stats.
+	// Sentinel formationExitGX=-1 = no decode cached yet.
+	volatile int    formationExitGX;
+	volatile int    formationExitGY;
+	volatile double formationExitUpdateTime;
+#endif
 };
 
 extern SquadPathCacheSlot spcSlots[MAX_FORMATION_GROUPS];

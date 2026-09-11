@@ -2,6 +2,12 @@
 // FULL builds only (excluded by ZONEOPT_ZONEONLY via config.h inline stubs).
 
 #include "pathfind_cache.h"
+#if PATHFIND_STEP >= 5
+#include "navmesh_sched.h"
+#endif
+#if PATHFIND_STEP >= 6
+#include "pathfinding.h"
+#endif
 
 #if PATHFIND_STEP >= 1
 
@@ -47,7 +53,52 @@ void LogPhase12Stats(double now)
 	long rpInjects = InterlockedCompareExchange(&p12DiagRepathInjections, 0, 0);
 	long scSkips   = InterlockedCompareExchange(&p12DiagSCGuardSkips, 0, 0);
 
-	if (rpHits == 0 && subBoosts == 0 && fbTags == 0)
+#if PATHFIND_STEP >= 5
+	long rpFlag  = InterlockedCompareExchange(&reprioFlagFires, 0, 0);
+	long rpTimer = InterlockedCompareExchange(&reprioTimerFires, 0, 0);
+	long rpOrder = InterlockedCompareExchange(&reprioOrderFires, 0, 0);
+#endif
+
+#if PATHFIND_STEP >= 6
+	long efDec   = InterlockedCompareExchange(&exitFaceDecodes, 0, 0);
+	long efSame  = InterlockedCompareExchange(&exitFaceDecodesUnchanged, 0, 0);
+	long efFail  = InterlockedCompareExchange(&exitFaceFailures, 0, 0);
+	long efErr   = InterlockedCompareExchange(&exitFaceDecodeErrors, 0, 0);
+	long efRace  = InterlockedCompareExchange(&exitFaceSCRace, 0, 0);
+	long rcmIns  = InterlockedCompareExchange(&reqCharMapInserts, 0, 0);
+	long rcmHit  = InterlockedCompareExchange(&reqCharMapLookupHits, 0, 0);
+	long rcmMiss = InterlockedCompareExchange(&reqCharMapLookupMiss, 0, 0);
+	long rcmOver = InterlockedCompareExchange(&reqCharMapOverflows, 0, 0);
+	long rcmPeak = InterlockedCompareExchange(&reqCharMapHighWater, 0, 0);
+	long rcmPrune = InterlockedCompareExchange(&reqCharMapDirectPrune, 0, 0);
+	long rcmSups  = InterlockedCompareExchange(&reqCharMapSuperseded, 0, 0);
+	long npcSkip = InterlockedCompareExchange(&npcRequestsSkipped, 0, 0);
+#endif
+
+#if PATHFIND_STEP >= 7
+	long fdHits = InterlockedCompareExchange(&formationDedupHits, 0, 0);
+	long fdProp = InterlockedCompareExchange(&formationPropagations, 0, 0);
+	long paEnq  = InterlockedCompareExchange(&preloadAheadEnqueued, 0, 0);
+	long evicts = InterlockedCompareExchange(&watchedEvictions, 0, 0);
+#endif
+
+#if PATHFIND_STEP >= 9
+	long ecr    = InterlockedCompareExchange(&extractionCrashRescue, 0, 0);
+	long ssHold = InterlockedCompareExchange(&spcStabilityHold, 0, 0);
+	long aiHook = InterlockedCompareExchange(&addInstanceHookCalls, 0, 0);
+#endif
+
+	if (rpHits == 0 && subBoosts == 0 && fbTags == 0
+#if PATHFIND_STEP >= 6
+	    && efDec == 0 && rcmIns == 0
+#endif
+#if PATHFIND_STEP >= 7
+	    && fdHits == 0 && paEnq == 0 && evicts == 0
+#endif
+#if PATHFIND_STEP >= 9
+	    && ecr == 0 && ssHold == 0 && aiHook == 0
+#endif
+	   )
 		return;
 
 	std::ostringstream ss;
@@ -59,7 +110,34 @@ void LogPhase12Stats(double now)
 	   << " rpLeaders=" << rpLeaders
 	   << " rpInjects=" << rpInjects
 	   << " scSkips=" << scSkips
-	   << " pendOrd=" << pendingOrderCount;
+	   << " pendOrd=" << pendingOrderCount
+#if PATHFIND_STEP >= 5
+	   << " reprio=" << rpOrder << "ord/" << rpFlag << "flg/" << rpTimer << "tmr"
+#endif
+#if PATHFIND_STEP >= 6
+	   << " exitFace=" << efDec << "dec/" << efSame << "same/"
+	   << efFail << "noCross/" << efErr << "err/" << efRace << "race"
+	   << " reqMap=" << rcmIns << "ins/" << rcmHit << "hit/" << rcmMiss << "miss"
+	   << "/peak" << rcmPeak
+	   << "/prune" << rcmPrune
+	   << "/sup" << rcmSups
+	   << " npcSkip=" << npcSkip
+#endif
+#if PATHFIND_STEP >= 7
+	   << " fmtDedup=" << fdHits << "hits/" << fdProp << "prop"
+	   << " preAhead=" << paEnq
+	   << " evict=" << evicts
+#endif
+#if PATHFIND_STEP >= 9
+	   << " extractAV=" << ecr
+	   << " stabHold=" << ssHold
+	   << " addInst=" << aiHook
+#endif
+	   ;
+#if PATHFIND_STEP >= 6
+	if (rcmOver > 0)
+		ss << " OVF=" << rcmOver;
+#endif
 	LogMsg(ss.str());
 }
 
@@ -118,6 +196,11 @@ void SpcResetSlot(int s)
 	spcSlots[s].state = 0;
 	spcSlots[s].servedCount = 0;
 	spcSlots[s].goalFaceKey = 0;
+#if PATHFIND_STEP >= 7
+	spcSlots[s].formationExitGX         = -1;
+	spcSlots[s].formationExitGY         = -1;
+	spcSlots[s].formationExitUpdateTime = 0.0;
+#endif
 }
 
 void SpcResetAll()

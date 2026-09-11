@@ -3,6 +3,9 @@
 #include "nm_workers.h"
 #include "tracking.h"
 #include "formation.h"
+#include "islands.h"
+#include "hooks.h"
+#include "navmesh_sched.h"
 
 
 PreloadedZone preloadedZones[MAX_PRELOADED];
@@ -69,15 +72,83 @@ void ClearPreloadState()
 	{
 		watchedChars[i].character = 0;
 		watchedChars[i].charMovement = 0;
+#if PATHFIND_STEP >= 5
+		watchedChars[i].hasMoveOrder = false;
+#endif
 		watchedChars[i].destZoneX = -1;
 		watchedChars[i].destZoneY = -1;
 		watchedChars[i].currentZoneX = -1;
 		watchedChars[i].currentZoneY = -1;
 		watchedChars[i].addedTime = 0.0;
+#if PATHFIND_STEP >= 6
+		watchedChars[i].exitZonePacked     = EXIT_ZONE_NONE;
+		watchedChars[i].exitFaceUpdateTime = 0.0;
+#endif
+#if PATHFIND_STEP >= 7
+		watchedChars[i].formationGroupId       = -1;
+		watchedChars[i].preloadAheadGX         = PRELOAD_AHEAD_NONE;
+		watchedChars[i].preloadAheadGY         = PRELOAD_AHEAD_NONE;
+		watchedChars[i].preloadAheadUpdateTime = 0.0;
+#endif
 	}
 	numWatched = 0;
 	ClearNavMeshCache();
 	ClearFormationGroups();
+	IslandReset();
+}
+
+
+// Iteration order for registration/promotion.
+//   ISLAND_STEP >= 3: navmesh tiers 1-3 first (camera grid, movers' current and
+//   next zones, mover clusters), then camera-owned before character-owned, then
+//   index — so the zones a travelling squad is about to need are registered
+//   and promoted before speculative ones (shrinks the parked-at-edge window).
+//   Otherwise: the historical order (ownerPasses: camera-owned then
+//   character-owned; else plain index order).
+static int BuildPreloadOrder(int* order, bool ownerPasses)
+{
+	int n = 0;
+#if ISLAND_STEP >= 3
+	(void)ownerPasses;
+	static SchedContext ctx;   // main thread only; ~1.3 KB kept off the stack
+	BuildSchedContext(&ctx);
+	int key[MAX_PRELOADED];
+	for (int i = 0; i < numPreloaded; ++i)
+	{
+		int tier = ComputeZonePriority(preloadedZones[i].gridX, preloadedZones[i].gridY,
+		                               ctx.camX, ctx.camY, ctx.movers, ctx.moverCount,
+		                               ctx.zones, ctx.zoneCount);
+		if (tier < 1) tier = 1;
+		if (tier > 5) tier = 5;
+		int ownerRank = (preloadedZones[i].owner == OWNER_CAMERA) ? 0 : 1;
+		key[i] = tier * 2 + ownerRank;
+		// Stable insertion sort by key (numPreloaded <= 45)
+		int k = n++;
+		while (k > 0 && key[order[k - 1]] > key[i])
+		{
+			order[k] = order[k - 1];
+			--k;
+		}
+		order[k] = i;
+	}
+#else
+	if (ownerPasses)
+	{
+		for (int pass = 0; pass < 2; ++pass)
+		{
+			int targetOwner = (pass == 0) ? OWNER_CAMERA : OWNER_CHARACTER;
+			for (int i = 0; i < numPreloaded; ++i)
+				if (preloadedZones[i].owner == targetOwner)
+					order[n++] = i;
+		}
+	}
+	else
+	{
+		for (int i = 0; i < numPreloaded; ++i)
+			order[n++] = i;
+	}
+#endif
+	return n;
 }
 
 
@@ -197,12 +268,23 @@ void FlushCameraQueue()
 
 void EnqueueCameraGrid(int centerX, int centerY)
 {
+#if PATHFIND_STEP >= 8
+	// STEP 8: 2x2 pattern (positive offsets) matches SMALL_DX/DY pause mechanism.
+	// Was 3x3 (9 zones) + EnqueueAheadZones (3 zones) = 12 zones/prediction; now 4.
+	for (int i = 0; i < 4; ++i)
+	{
+		int zx = centerX + SMALL_DX[i];
+		int zy = centerY + SMALL_DY[i];
+		EnqueueCameraZone(zx, zy);
+	}
+#else
 	for (int i = 0; i < 9; ++i)
 	{
 		int zx = centerX + ORDER_DX[i];
 		int zy = centerY + ORDER_DY[i];
 		EnqueueCameraZone(zx, zy);
 	}
+#endif
 }
 
 static bool EnqueueZoneByOwner(int gx, int gy, int owner)
@@ -371,8 +453,12 @@ void TryRegisterPreloadedZones(void* zoneMgr, double now)
 	if (!fn_registerZoneSections)
 		return;
 
-	for (int i = 0; i < numPreloaded; ++i)
+	int order[MAX_PRELOADED];
+	int orderCount = BuildPreloadOrder(order, /*ownerPasses=*/false);
+
+	for (int k = 0; k < orderCount; ++k)
 	{
+		int i = order[k];
 		if (!preloadedZones[i].pending)
 			continue;
 		if (preloadedZones[i].registered)
@@ -461,18 +547,18 @@ void TryPromotePreloadedZones(void* zoneMgr, double now)
 
 	bool didFullPromotion = false;
 
-	// Camera-owned first, one full promotion per frame (notifyAccessible is expensive)
-	for (int pass = 0; pass < 2; ++pass)
-	{
-		int targetOwner = (pass == 0) ? OWNER_CAMERA : OWNER_CHARACTER;
+	// Camera-owned first (tier 1-3 zones first at ISLAND_STEP >= 3), one full
+	// promotion per frame (notifyAccessible is expensive)
+	int order[MAX_PRELOADED];
+	int orderCount = BuildPreloadOrder(order, /*ownerPasses=*/true);
 
-		for (int i = 0; i < numPreloaded; ++i)
+	{
+		for (int k = 0; k < orderCount; ++k)
 		{
+			int i = order[k];
 			if (!preloadedZones[i].pending || preloadedZones[i].promoted)
 				continue;
 			if (preloadedZones[i].pipelineHandoff)
-				continue;
-			if (preloadedZones[i].owner != targetOwner)
 				continue;
 
 			if (!preloadedZones[i].registered)
@@ -551,6 +637,19 @@ void TryPromotePreloadedZones(void* zoneMgr, double now)
 				continue;
 			}
 
+#if ISLAND_STEP >= 3 && defined(ZONEOPT_DEBUG)
+			// Test hook: hold promotion N seconds after registration so a
+			// travelling squad reaches the island edge before the zone joins
+			// (forces the Step 3 race). Must stay below the 10 s stall timeout.
+			if (cfg_islandTestPromoteDelay > 0.0
+			    && now - preloadedZones[i].loadTimeSec < cfg_islandTestPromoteDelay)
+				continue;
+#endif
+
+			// Island overlay: mark before the zone becomes accessible so the
+			// next rebuild (requested below) sees it as a mod zone.
+			IslandMarkModZone(zoneMgr, preloadedZones[i].gridX, preloadedZones[i].gridY);
+
 			// WORD write: atomically clear +176, set +177
 			*(unsigned short*)((uintptr_t)ze + OFF_ZONE_IS_LOADING) = 0x0100;
 
@@ -560,6 +659,8 @@ void TryPromotePreloadedZones(void* zoneMgr, double now)
 
 			// Safe sole invocation: our zones bypass Set A/B (direct loadSingleZone)
 			fn_notifyAccessible(zoneMapContent);
+
+			IslandRequestRebuild();
 
 			preloadedZones[i].promoted = true;
 			preloadedZones[i].pending = false;
@@ -784,11 +885,21 @@ bool TrySquadSwitchSwap(void* zoneMgr, int camGX, int camGY)
 	predictedCenterY = camGY;
 
 	int missing = 0;
+#if PATHFIND_STEP >= 8
+	// STEP 8: match the new camera 2x2 pattern so a squad-switch jump
+	// doesn't re-queue an exception-to-the-rule 3x3 grid.
+	for (int i = 0; i < 4; ++i)
+	{
+		if (EnqueueCameraZone(camGX + SMALL_DX[i], camGY + SMALL_DY[i]))
+			missing++;
+	}
+#else
 	for (int i = 0; i < 9; ++i)
 	{
 		if (EnqueueCameraZone(camGX + ORDER_DX[i], camGY + ORDER_DY[i]))
 			missing++;
 	}
+#endif
 
 	std::ostringstream ss;
 	ss << "[ZoneOpt] Squad switch swap: (" << camGX << "," << camGY << ")"

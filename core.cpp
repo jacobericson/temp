@@ -8,6 +8,9 @@
 LARGE_INTEGER qpcFrequency;
 LARGE_INTEGER pluginStartTime;
 
+// Set once on first hook_dispatchJob call via InterlockedCompareExchange.
+volatile DWORD g_navMeshBgThreadId = 0;
+
 
 // =========================================================================
 // Log utilities
@@ -47,6 +50,11 @@ void InitLogFile()
 		logCSInitialized = true;
 		mainThreadId = GetCurrentThreadId();
 	}
+}
+
+bool IsMainThread()
+{
+	return mainThreadId != 0 && GetCurrentThreadId() == mainThreadId;
 }
 
 static void OpenLogFile()

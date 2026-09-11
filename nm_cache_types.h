@@ -63,20 +63,8 @@ struct NavMeshCacheEntry {
 const int NM_CACHE_SIZE = 256;
 
 
-struct WorkerScratch { void** buffer; int capacity; };
-
-const int MAX_DEEPCOPY_ARRAYS = 8;
-struct DeepCopyAlloc {
-	void* buffer;
-	int   wbOffset;
-};
-struct DeepCopyTracker {
-	DeepCopyAlloc allocs[MAX_DEEPCOPY_ARRAYS];
-	int count;
-};
-
 const int NMG_STRUCT_SIZE = 352;  // NavMeshGenerator object size (operator new(0x160))
-const int WB_OBJECT_SIZE = 0x218;  // hkaiNavMeshGenerationSettings: 0x208 + sizeof(hkArray) = 536 bytes
+const int WB_OBJECT_SIZE = 0x220;  // hkaiNavMeshGenerationSettings: 544 bytes (confirmed from settings dtor 0xDDABE0: default free size = 544)
 
 // hkArray flag: data is not owned by this array, do not free/realloc (hkArray.h)
 const int HKARRAY_DONT_DEALLOCATE = (int)0x80000000;
