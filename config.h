@@ -44,6 +44,36 @@
   #define ISLAND_STEP 0
 #endif
 
+// Round 1 navmesh MISS-path fixes staging gate (research/navmesh_miss_split.md
+// §7.8). Set via /DNMFIX_STEP=N on the cl line. Steps 1..8; 8 is the worker
+// dequeue and HIT-identity rewrite (B8/ZO-04 + O3), kept above A8's teardown so
+// the two stay separately bisectable.
+// Default 8 since Round 1 (2026-09-12): steps 1..8 all shipped, so every variant
+// carries them. The ladder still builds any lower rung via /DNMFIX_STEP=N for
+// regression bisection.
+// Temporary gate — removed after validation.
+#ifndef NMFIX_STEP
+  #define NMFIX_STEP 8
+#endif
+
+// Phase 18 preload pipeline staging gate (research/preload_pipeline.md). Set via
+// /DPRELOAD_STEP=N on the cl line. Steps 1..6. Step 1 (per-zone pipeline
+// latencies, the transition drop count, the H15 benchmark) shipped in Round 2;
+// build_opt_step4.bat defaults this to 1. Steps 2-6 are still unused.
+// Temporary gate — removed after validation.
+#ifndef PRELOAD_STEP
+  #define PRELOAD_STEP 0
+#endif
+
+// Phase 17 path worker pool staging gate (research/path_worker_pool.md). Set via
+// /DPATHPOOL_STEP=N on the cl line. Steps 1..5. Step 1 (the four pass-through
+// hooks, PathQueue/GateRate/PathSlow/AstarCost/NpcPathWait) shipped in Round 2;
+// build_opt_step4.bat defaults this to 1. Steps 2-5 are still unused.
+// Temporary gate — removed after validation.
+#ifndef PATHPOOL_STEP
+  #define PATHPOOL_STEP 0
+#endif
+
 
 // =========================================================================
 // Feature flags (runtime, default true)
@@ -59,19 +89,73 @@ extern bool groupCohesionEnabled;
 #endif
 #if PATHFIND_STEP >= 1
 extern bool pathfindDiagEnabled;
+// H5: the squad path cache injection (Report 4 CTD, research/squad_path_cache_crash.md)
+// is compiled out of every shipped variant. Only a build that defines
+// ZONEOPT_SQUAD_CACHE (Phase 16 staging) gets the mutable flag; every other
+// build sees a compile-time false, so every assignment site outside that
+// macro fails to compile and every read folds to dead code.
+#ifdef ZONEOPT_SQUAD_CACHE
 extern bool squadPathCacheEnabled;
+#else
+static const bool squadPathCacheEnabled = false;
+#endif
 #endif
 #if PATHFIND_STEP >= 2
 extern bool stuckRetryEnabled;
 #endif
 extern bool islandFixEnabled;            // islandFix: overlay answers the island hooks (ISLAND_STEP >= 2)
 
+// destroyListDiag: install the pass-through hook on GameWorld::destroyListOE's
+// sole inserter (crash-3 diagnostic, core.h). It only records the calling
+// thread, but it is still a 5-byte patch into a hot engine function, so PROD
+// leaves it off and DEV turns it on. The invariant probe itself is always on in
+// every build and is not gated by this key.
+extern bool destroyListDiagEnabled;
+
+// destroyListDefer: the crash-3 mitigation (core.h). Off-main-thread inserts
+// into GameWorld::destroyListOE are queued and replayed on the main thread, so
+// the unsynchronised container has a single writer. On by default in every
+// build; setting it false leaves the hook installed as the plain diagnostic,
+// which is the A/B control. The hook is installed when either this or
+// destroyListDiag is on.
+extern bool destroyListDeferEnabled;
+
+// saveLoadUnload: the Round 2 save-load crash fix (preload.cpp,
+// hook_resetUnloadZones). At the game's save-load reset, after it unloads the
+// zones in Set A and Set B, unload every zone still holding a content (the
+// mod's, which are in neither set) and clear the mod's state there. On by
+// default in every build, PROD included. false = today's behaviour for
+// bisection: nothing unloaded and the state clear left to the ZM+8 edge; the
+// survivors are still counted and logged ("would unload").
+extern bool saveLoadUnloadEnabled;
+
+// islandReadinessRule: per-caller readiness rule (Phase 15 item (d), H4) in
+// hook_isContentPending; A/B key for Round 2 (H2). Off by default; nothing
+// reads it yet.
+extern bool islandReadinessRuleEnabled;
+
+// readinessOverrides: false = the H15 control -- every readiness override off
+// (the isContentPending deferral and the promotion fallback) (H2, Z). On by
+// default; nothing reads it yet.
+extern bool readinessOverridesEnabled;
+
+// npcWaitDiag: Phase 17 Step 1 NPC path-wait diagnostic (P). DEV default on,
+// PROD default off; nothing reads it yet.
+extern bool npcWaitDiagEnabled;
+
+// gatePassDiag: Phase 17 Step 1 per-pass gate-code timing (P). DEV default
+// on, PROD default off; nothing reads it yet.
+extern bool gatePassDiagEnabled;
+
 
 // =========================================================================
 // NavMesh worker pool constants
 // =========================================================================
 
-const int NAVMESH_WORKER_COUNT = 3;
+// Capacity, not the live count: it sizes the worker handle arrays and the L2
+// in-flight table, and bounds what navmeshWorkerCount may be set to. The number
+// of workers actually created is g_navMeshWorkerCount (default 3).
+const int NAVMESH_WORKER_COUNT = 6;
 const int WORKBUF_SIZE = 65536;  // workBuffer clone size (runtime probe: allocSize=65536)
 
 
@@ -88,6 +172,12 @@ const int MAX_FORMATION_MEMBERS_LIMIT = 64;  // hard cap for embedded FormationM
 
 // Zone loading
 extern float  cfg_preloadThreshold;      // units from zone center (transition at 4147.2)
+// loadSingleZone's 4th argument (xmm3) for the zones the mod preloads. The game
+// writes it to zoneEntry + 4*(timerIndex + 48) and it decides when that zone is
+// unloaded again. 0 takes the game's own per-timer default, which is what
+// processState2 passes; a positive value overrides it. Exists so the surviving
+// half of crash-3 hypothesis H2 can be A/B'd (0 vs 3600) without a rebuild.
+extern float  cfg_preloadKeepAliveSeconds;
 extern int    cfg_cameraReserved;        // camera queue slots
 
 // Character tracking
@@ -104,6 +194,20 @@ extern float  cfg_gatherRadiusSq;        // squared radius for gather detection
 
 // NavMesh workers
 extern int    cfg_navmeshWorkerCount;    // worker thread count (capped at NAVMESH_WORKER_COUNT)
+// The clamped worker count, i.e. how many threads CreateNavMeshWorkers starts
+// and how many the priority boost/restore loops walk. Set once from
+// cfg_navmeshWorkerCount after clamping.
+extern int    g_navMeshWorkerCount;
+
+// NavMesh L2 disk cache
+extern int    cfg_navmeshDiskCacheMaxMB; // navmesh_cache\ size cap in MB; past it the
+                                         // oldest files are deleted down to 75% of the cap
+
+// FNV-1a over the game's active mod list (mods.cfg), read once on the main
+// thread in LoadConfig. Part of every L2 disk cache filename: a changed mod set
+// can move terrain and buildings, so its meshes must not be reused (ZO-11).
+// 0 means "mod list unavailable".
+extern unsigned int g_modSetHash;
 
 // Hook orchestration
 extern double cfg_camLogInterval;        // debug camera log interval

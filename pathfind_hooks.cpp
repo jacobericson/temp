@@ -11,6 +11,7 @@
 
 #include "pathfind_diag.h"
 #include "pathfind_cache.h"
+#include "path_pool.h"
 
 #if PATHFIND_STEP >= 6
 #include "tracking.h"
@@ -20,6 +21,23 @@
 #endif
 
 #if PATHFIND_STEP >= 1
+
+// Phase 17 Step 1 (research/path_worker_pool.md §7): request pointer recovered
+// by hook_csFindPath, for whichever request hook_findPathFull runs next on
+// this thread, so its PathSearchSample can carry playerByReq (*(int*)(req+0x2C)
+// >= 20) without waiting for Step 2's request-derived tag rework. Round 2
+// final review Important #2: OFF_REQ_RESULTBUF_SLOT (game.h) moved out of the
+// PATHFIND_STEP >= 6 block it used to live in -- hook_csFindPath installs at
+// step >= 1 (main.cpp) and the dispatcher passes req+128 as resultBuf at
+// every step, so this tag (and the playerByReq/disagree= diagnostics it
+// feeds) is live from step 1 too; previously every boosted sample below step
+// 6 read back as "unk" and disagree= was 0 by construction. Thread-local for
+// the same reason as currentRequestIsPlayer below: findPathFull has 6 callers
+// and only the csFindPath -> fallback -> findPathFull chain shares a thread.
+// hook_findPathFull consumes and clears it, so a call that did not come
+// through hook_csFindPath first (the gate pass calls findPathFull directly)
+// reports playerByReq = -1.
+static __declspec(thread) void* g_pathPoolLastCsFindPathReq = NULL;
 
 #if PATHFIND_STEP >= 2
 // BG thread tag: set by hook_csFindPath, read by hook_findPathFull.
@@ -424,10 +442,22 @@ char hook_csFindPath(void* manager, unsigned int startFaceKey, void* startPos,
 	else
 		InterlockedIncrement(&diagPrimaryFail);
 
+	// Phase 17 Step 1: tag this request for whichever hook_findPathFull call
+	// runs next on this thread (playerByReq). Set on every call, success or
+	// failure -- on success no findPathFull call follows for this request, so
+	// the tag is simply overwritten by the next request's csFindPath call (or
+	// consumed and cleared by an unrelated findPathFull call in between).
+	// Round 2 final review Important #2: live from step >= 1 now (game.h moved
+	// OFF_REQ_RESULTBUF_SLOT out of its old PATHFIND_STEP >= 6 block); the game
+	// passes req+128 as resultBuf at every step hook_csFindPath is installed.
+	g_pathPoolLastCsFindPathReq = resultBuf ? (void*)((char*)resultBuf - OFF_REQ_RESULTBUF_SLOT) : NULL;
+
 #if PATHFIND_STEP >= 6
 	// Direct-path success: findPathFull won't run for this request, so any
 	// reqCharMap entry for it would orphan. Prune now. Same resultBuf->requestObj
 	// recovery as hook_csFindPathFallback (dispatcher passes req+128 as resultBuf).
+	// reqCharMap itself is step >= 6 only (ExitFace identification chain), so
+	// this part stays gated even though the tag above no longer is.
 	if (result && resultBuf) {
 		void* reqObj = (void*)((char*)resultBuf - OFF_REQ_RESULTBUF_SLOT);
 		ReqCharMapPrune(reqObj);
@@ -559,6 +589,26 @@ void hook_findPathFull(void* streamingCollection, void* searchState, void* findP
 {
 	InterlockedIncrement(&diagAstarAttempts);
 
+	// Phase 17 Step 1 (research/path_worker_pool.md §7): resolve playerByReq
+	// once per call from whichever request hook_csFindPath tagged just before
+	// on this thread (cleared so an unrelated call, e.g. the gate pass calling
+	// findPathFull directly, reports -1), track whether this call's search
+	// budget gets boosted, and take the "before" QPC immediately ahead of
+	// whichever branch below calls orig_findPathFull. All three converge on
+	// the shared status/cause/iterCount block below, which takes the "after"
+	// QPC and calls PathPoolNoteSearch -- exactly once per invocation, on
+	// every thread, no allocation, no logging.
+	// Round 2 final review Important #2: live from step >= 1 (see
+	// g_pathPoolLastCsFindPathReq's declaration comment above).
+	int pathPoolPlayerByReq = -1;
+	if (g_pathPoolLastCsFindPathReq) {
+		pathPoolPlayerByReq = (*(int*)((uintptr_t)g_pathPoolLastCsFindPathReq + 0x2C) >= 20) ? 1 : 0;
+		g_pathPoolLastCsFindPathReq = NULL;
+	}
+	int pathPoolBoosted = 0;
+	LARGE_INTEGER pathPoolQpcBefore;
+	pathPoolQpcBefore.QuadPart = 0;
+
 	// One-time FindPathInput layout probe
 	if (searchState && !InterlockedCompareExchange(&probeFPIDumped, 1, 0))
 	{
@@ -599,6 +649,7 @@ void hook_findPathFull(void* streamingCollection, void* searchState, void* findP
 		uintptr_t ss = (uintptr_t)searchState;
 		*(int*)(ss + 156) = 131072 * 4;   // open set: 512KB (default 128KB)
 		*(int*)(ss + 160) = 590336 * 4;   // search state: ~2.3MB (default 590KB)
+		pathPoolBoosted = 1;
 	}
 #endif
 
@@ -630,8 +681,12 @@ void hook_findPathFull(void* streamingCollection, void* searchState, void* findP
 		}
 	}
 
+#ifdef ZONEOPT_SQUAD_CACHE
 	// =================================================================
 	// Squad path cache: multi-slot leader detection, A* boost, caching, injection
+	// H5: this whole block (leader detection, caching, injection) only exists
+	// when ZONEOPT_SQUAD_CACHE is defined -- no shipped build defines it. The
+	// Report 4 CTD lives in here (research/squad_path_cache_crash.md).
 	// =================================================================
 	if (squadPathCacheEnabled && searchState)
 	{
@@ -699,8 +754,10 @@ void hook_findPathFull(void* streamingCollection, void* searchState, void* findP
 				// Boost A* budget: 4x default
 				*(int*)(ss + 156) = 131072 * SPC_BUDGET_MULT;
 				*(int*)(ss + 160) = 590336 * SPC_BUDGET_MULT;
+				pathPoolBoosted = 1;
 				InterlockedIncrement(&spcDiagBoosted);
 
+				QueryPerformanceCounter(&pathPoolQpcBefore);
 				orig_findPathFull(streamingCollection, searchState, findPathOutput);
 				unsigned char leaderStatus = *(unsigned char*)(fpo + 60);
 
@@ -842,6 +899,7 @@ void hook_findPathFull(void* streamingCollection, void* searchState, void* findP
 			{
 				slot.goalFaceKey = spcLastConnDestFace;
 
+				QueryPerformanceCounter(&pathPoolQpcBefore);
 				orig_findPathFull(streamingCollection, searchState, findPathOutput);
 				unsigned char leaderStatus = *(unsigned char*)(fpo + 60);
 
@@ -877,22 +935,52 @@ void hook_findPathFull(void* streamingCollection, void* searchState, void* findP
 			}
 		}
 	}
+#endif // ZONEOPT_SQUAD_CACHE
 #endif // PATHFIND_STEP >= 4
 
 #if PATHFIND_STEP >= 4
+#ifdef ZONEOPT_SQUAD_CACHE
 default_astar:
+#endif
 #endif
 
 	// Default path: call original A*
+	QueryPerformanceCounter(&pathPoolQpcBefore);
 	orig_findPathFull(streamingCollection, searchState, findPathOutput);
 
 #if PATHFIND_STEP >= 4
+#ifdef ZONEOPT_SQUAD_CACHE
 diag_count:
+#endif
 #endif
 	{
 		unsigned char status = *(unsigned char*)((uintptr_t)findPathOutput + 60);
 		unsigned char cause  = *(unsigned char*)((uintptr_t)findPathOutput + 61);
 		int iterCount        = *(int*)((uintptr_t)findPathOutput + 48);
+
+		// Phase 17 Step 1: every branch above that calls orig_findPathFull
+		// (default, and -- ZONEOPT_SQUAD_CACHE only -- AWAITING_LEADER and
+		// REPATH_ACTIVE) converges here exactly once per hook_findPathFull
+		// call, whether by fallthrough or by goto. Take the "after" QPC and
+		// hand the sample to the pool on every thread, every call.
+		{
+			LARGE_INTEGER pathPoolQpcAfter;
+			QueryPerformanceCounter(&pathPoolQpcAfter);
+
+			PathSearchSample pathPoolSample;
+			pathPoolSample.ticks      = pathPoolQpcAfter.QuadPart - pathPoolQpcBefore.QuadPart;
+			pathPoolSample.iterations = iterCount;
+			pathPoolSample.status     = (int)status;
+			pathPoolSample.cause      = (int)cause;
+			pathPoolSample.boosted    = pathPoolBoosted;
+#if PATHFIND_STEP >= 2
+			pathPoolSample.playerByTag = currentRequestIsPlayer ? 1 : 0;
+#else
+			pathPoolSample.playerByTag = 0;
+#endif
+			pathPoolSample.playerByReq = pathPoolPlayerByReq;
+			PathPoolNoteSearch(&pathPoolSample);
+		}
 
 #if PATHFIND_STEP >= 4
 		if (probeSlot >= 0 && probeSlot < PATH_PROBE_SIZE)
@@ -1202,6 +1290,10 @@ char hook_csFindPathFallback(void* manager, unsigned int startFaceKey, void* sta
 	}
 #endif
 
+#ifdef ZONEOPT_SQUAD_CACHE
+	// H5: tagging a request for the squad path cache only exists when
+	// ZONEOPT_SQUAD_CACHE is defined. currentBgReq (above) stays live in every
+	// build -- the ExitFace chain reads it.
 	spcFallbackTag = 0;
 
 	if (squadPathCacheEnabled)
@@ -1238,11 +1330,14 @@ char hook_csFindPathFallback(void* manager, unsigned int startFaceKey, void* sta
 			}
 		}
 	}
+#endif // ZONEOPT_SQUAD_CACHE
 
 	char result = orig_csFindPathFallback(manager, startFaceKey, startPos,
 	                                       destFaceKey, destPos, radius,
 	                                       param6, param7, resultBuf);
+#ifdef ZONEOPT_SQUAD_CACHE
 	spcFallbackTag = 0;
+#endif
 #if PATHFIND_STEP >= 6
 	currentBgReq = NULL;
 #endif
@@ -1287,6 +1382,9 @@ unsigned __int64 hook_contentStreamCallee0x8869(void* manager,
 {
 	unsigned int origCount = resultBuf ? resultBuf[2] : 0;
 	unsigned __int64 result = origCount;
+	// B7: a fault in the extraction chain is what this guard exists for, and
+	// the rescue counter records it. Keep it out of the crash recorder.
+	GuardEnter();
 	__try {
 		result = orig_contentStreamCallee0x8869(manager, faceKey, searchOutput, resultBuf);
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1294,6 +1392,7 @@ unsigned __int64 hook_contentStreamCallee0x8869(void* manager,
 		if (resultBuf) resultBuf[2] = origCount;
 		result = origCount;
 	}
+	GuardLeave();
 	return result;
 }
 

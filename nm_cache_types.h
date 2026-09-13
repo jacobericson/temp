@@ -82,4 +82,31 @@ struct L2MissEntry {
 };
 
 
+// L2 disk cache rejection reasons. A rejection means the file existed but was
+// not trustworthy; a plain "no such file" is a miss, not a rejection.
+// Reported as l2Rej=<total>(m/v/h/l/c/b/i/a/p) on the NM cache stats line.
+enum L2RejectReason {
+	L2REJ_MAGIC = 0,    // m: not one of our files
+	L2REJ_VERSION,      // v: written by a different format version
+	L2REJ_SETTINGS,     // h: generation settings hash differs
+	L2REJ_LENGTH,       // l: payload length disagrees with the counts or the file size
+	L2REJ_CRC,          // c: checksum mismatch over the header tail and the payload
+	L2REJ_BOUNDS,       // b: a count or striding outside sane maxima
+	L2REJ_IO,           // i: short read
+	L2REJ_ALLOC,        // a: allocation failed, entry discarded whole
+	L2REJ_PATHLONG,     // p: a path did not fit its buffer; that file is skipped
+	L2REJ_REASON_COUNT
+};
+
+// Sane upper bounds for the payload counts. Faces/edges/vertices keep the
+// limits StoreCacheEntry has always applied; the data arrays and the stridings
+// are bounded here for the first time (ZO-02).
+const int L2_MAX_FACES    = 50000;
+const int L2_MAX_EDGES    = 200000;
+const int L2_MAX_VERTICES = 100000;
+const int L2_MAX_FACEDATA = 1000000;
+const int L2_MAX_EDGEDATA = 2000000;
+const int L2_MAX_STRIDING = 64;
+
+
 #endif // KENSHI_ZONE_OPT_NM_CACHE_TYPES_H

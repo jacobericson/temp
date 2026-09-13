@@ -72,11 +72,10 @@ extern volatile long g_slabAllocWorkerHits;
 // WorkBuffer clone size (set by quality probe, read by workers/dispatch)
 extern volatile long g_workBufAllocSize;
 
-// FLA allocator CS probe state (written by probe, read by stats reporter)
-extern volatile long flaHooksInstalled;   // 0=pending, 1=installing, 2=done
-extern volatile long csProbeFLAPtrLo;
-extern volatile long csProbeFLAPtrHi;
-extern volatile long g_flaCSAcquisitions; // Sum of CS enter counts across the 4 FLA hooks
+// Lazy hook install marker (0=pending, 1=installing, 2=done) for the hooks
+// InstallNavMeshLazyHooks puts in on the first dispatch: the edgeProcess
+// clone-guard, the populate pass-through and the processJobAlt tripwire.
+extern volatile long lazyHooksInstalled;
 
 // Stage 4b: per-MISS NMG clone counters
 extern volatile long nmCloneConstructCount;      // successful clone allocations
@@ -96,8 +95,215 @@ extern volatile long nmLateHitCount;
 extern volatile long g_edgeProcessArmedCount;
 extern volatile long g_edgeProcessUnarmedCount;
 
-// Disk cache directory (initialized by InitNavMeshCacheCS, used by nm_disk_cache)
+#if NMFIX_STEP >= 2
+// Material overrides on fresh work buffers (NMFIX 2). wbOv= reports the count
+// left in the +520 array after processJobAlt's finalizeDeep popped the entry
+// the job appended; 4 is correct. wbOvSlope= counts entries where the slope in
+// NM_MATERIAL_SLOPE_BITS disagreed with the one the game installed.
+extern volatile long g_wbOverrideInstalled;
+extern volatile long g_wbOverrideAfterPop;
+extern volatile long g_wbOverrideSlopeBad;
+// Teardown found more entries than ConstructFreshSettings can have appended, so
+// it left them alone. Reported as wbOvSkip= only when non-zero; expected 0.
+extern volatile long g_wbOverrideSkipped;
+#endif
+
+#if NMFIX_STEP >= 3
+// wb+328 (m_minCharacterWidth) as written on the last fresh work buffer, held
+// as the raw float bits. 0.5 confirms the quality settings reached it.
+extern volatile long g_wbQualityLast;
+#endif
+
+#if NMFIX_STEP >= 4
+// Type-1 (partial) jobs whose partialGeneration call was made against the real
+// generator rather than a worker's clone. Reported as nbrLookup=.
+extern volatile long nmPartialRealCount;
+#endif
+
+#if NMFIX_STEP >= 5
+// processJobAlt called by a thread that did not own processJobCS. Reported as
+// trip=; expected 0 over a whole session.
+extern volatile long nmTripCount;
+// 0 until the tripwire hook is installed. trip= prints "off" while it is 0,
+// because no violations counted is not the same as none possible.
+extern volatile long nmTripInstalled;
+
+// Time spent inside orig_dispatchJob under processJobCS for type 2/3/4 jobs,
+// in tenths of a millisecond. Reported as t234=<avg>/<max>ms.
+extern volatile long nmT234Count;
+extern volatile long nmT234TotalMsTimes10;
+extern volatile long nmT234MaxMsTimes10;
+#endif
+
+#if NMFIX_STEP >= 6
+// Entries into a collision-build region (either hooked builder, or the
+// partialGeneration call) that found another region already in flight, i.e.
+// build regions in flight > 1. Reported as bcOverlap=.
+//
+// NOT "races prevented": two threads can both be in a build region and still
+// be serialized by the game's own build mutex inside buildSectionCollision.
+// What this counts is concurrency at the region level, which is the necessary
+// condition for the unguarded tail races, not proof one occurred.
+extern volatile long g_buildOverlapSeen;
+
+// buildCollisionCS wait (blocked in Enter) and hold (Enter to Leave) across all
+// three regions. Totals are 64-bit microseconds; the maxima are microseconds.
+// Reported as bcWait=<avg>/<max>ms bcHold=<avg>/<max>ms.
+extern volatile long     nmBcCount;
+extern volatile LONGLONG nmBcWaitTotalUs;
+extern volatile long     nmBcWaitMaxUs;
+extern volatile LONGLONG nmBcHoldTotalUs;
+extern volatile long     nmBcHoldMaxUs;
+#endif
+
+#if NMFIX_STEP >= 7
+// Leak Fix 3: semaphore handles closed when a worker's NMG clone is freed
+// (15 per clone), and handles skipped because they were still identical to the
+// real generator's, i.e. never re-created by fn_queueLockInit. hSkip= is
+// printed only when non-zero and should never appear.
+extern volatile long nmCloneHandleClosed;
+extern volatile long nmCloneHandleSkipped;
+
+// Leak Fix 1: bytes released per fresh-work-buffer teardown (the +520 guard,
+// the +288 material-map copy and the 544-byte block). DEV only, reported as
+// wbFreed=. It does NOT include what the dtor body itself frees, which is the
+// bulk of the fix and is not measurable from here.
+extern volatile LONGLONG nmWbFreedBytes;
+#endif
+
+#if NMFIX_STEP >= 8
+// A worker HIT that could not be served from its slot — the slot no longer held
+// the job's key by the time it reconstructed, the index was out of range, or the
+// reconstruct itself failed — so the job was regenerated instead of being
+// deleted with no mesh (B8/ZO-04). Reported as hitStale=; expected small.
+extern volatile long nmHitStaleCount;
+
+// L2 file reads skipped because another worker was already reading that exact
+// key, which only happens for duplicate jobs on one zone. Reported as dupL2=.
+extern volatile long nmDupL2Avoided;
+
+// The in-flight table had no free slot, so the read went ahead unregistered.
+// Distinct from dupL2: nobody was reading that key.
+extern volatile long nmL2FlightFull;
+
+#endif
+
+// Round 2 session 1 crash: a claimed job whose zone the game unloaded while the
+// job waited on processJobCS. Ungated: the re-check restores vanilla's own test
+// (dispatchJob_orig 0x3CE030 drops a job whose zone has no mapContent), and the
+// measurement is this round's. All written on the NavMesh bg thread and the
+// workers with Interlocked* only (no allocation, no logging there), read by the
+// main-thread stats reporter, cumulative since session start.
+//
+// processJobCS wait, per acquisition site: time blocked acquiring the lock.
+//   PJWAIT_CLONE  — the worker's CloneNMG snapshot lock (NMFIX_STEP >= 3)
+//   PJWAIT_WMISS  — missLock in ProcessNavMeshJob on a worker thread
+//   PJWAIT_BGMISS — missLock in ProcessNavMeshJob on the NavMesh bg thread
+// Reported as pjWait clone=<avg>/<max> wMiss=<avg>/<max> bgMiss=<avg>/<max>ms.
+enum PjWaitSite
+{
+	PJWAIT_CLONE      = 0,
+	PJWAIT_WMISS      = 1,
+	PJWAIT_BGMISS     = 2,
+	PJWAIT_SITE_COUNT = 3
+};
+extern volatile long     nmPjWaitCount[PJWAIT_SITE_COUNT];
+extern volatile LONGLONG nmPjWaitTotalUs[PJWAIT_SITE_COUNT];
+extern volatile long     nmPjWaitMaxUs[PJWAIT_SITE_COUNT];
+
+// Claim age: QPC at the job's unlink from the generator queue -> the zone
+// re-check. MISS: at the authoritative re-check right after missLock is
+// acquired (worker and bg thread). HIT: at the re-check at the top of
+// WorkerProcessHit, just before the reconstruct (worker HITs only; the bg
+// thread's own HIT path never waits on processJobCS). Reported as
+// claimAge miss=<avg>/<max> hit=<avg>/<max>ms and, for MISSes only, the bucket
+// counts [<10:a <100:b <1s:c <5s:d >=5s:e].
+enum { CLAIMAGE_BUCKET_COUNT = 5 };
+extern volatile long     nmClaimAgeMissCount;
+extern volatile LONGLONG nmClaimAgeMissTotalUs;
+extern volatile long     nmClaimAgeMissMaxUs;
+extern volatile long     nmClaimAgeMissBucket[CLAIMAGE_BUCKET_COUNT];
+extern volatile long     nmClaimAgeHitCount;
+extern volatile LONGLONG nmClaimAgeHitTotalUs;
+extern volatile long     nmClaimAgeHitMaxUs;
+
+// Claimed jobs dropped because their zone was unloaded, the way vanilla's early
+// return drops them (not freed, not enqueued). Reported as
+// stale=w<n>/bg<n>/hit<n>/early<n> staleLast=(x,y)t<type>/<reason>@<ms>ms.
+enum StaleSite
+{
+	STALE_SITE_WMISS  = 0,   // worker, after missLock
+	STALE_SITE_BGMISS = 1,   // bg thread, after missLock
+	STALE_SITE_HIT    = 2,   // worker HIT, before the reconstruct
+	STALE_SITE_EARLY  = 3,   // worker MISS, before CloneNMG
+	STALE_SITE_COUNT  = 4
+};
+enum StaleReason
+{
+	STALE_REASON_NONE       = 0,
+	STALE_REASON_NO_ZONE    = 1,   // job+0 (ZoneMap*) is NULL
+	STALE_REASON_NO_CONTENT = 2,   // ZoneMap+0 (mapContent) is NULL
+	STALE_REASON_NO_TERRAIN = 3    // ZoneMap+0xB8 (terrainCollision) is NULL
+};
+extern volatile long nmStaleCount[STALE_SITE_COUNT];
+// The last drop, as five plain volatile LONGs each written on its own (no lock
+// ties them together): a reader racing two drops can see fields from both (a
+// torn read), which is acceptable for a diagnostic that only reports the most
+// recent event.
+extern volatile long nmStaleLastGridX;
+extern volatile long nmStaleLastGridY;
+extern volatile long nmStaleLastType;
+extern volatile long nmStaleLastReason;
+extern volatile long nmStaleLastAgeUs;
+
+// Workers that completed Havok thread init and have not exited. Maintained
+// ungated, because the thread-init correction that feeds it is a plain fix
+// (H11); reported as workers=<live> from NMFIX 8.
+extern volatile long g_navMeshWorkersLive;
+
+// L2 rejection counters, one per L2RejectReason, and the size-cap eviction count
+extern volatile long l2RejCount[L2REJ_REASON_COUNT];
+extern volatile long l2CapEvicted;
+
+// NMFIX 1b: L2 writes refused because the entry had zero faces
+// (BuildDiskCacheBlob, NMFIX_STEP >= 1). Reported as l2ZeroSkip= only when
+// non-zero; expected absent, since L1 already refuses zero-face meshes.
+extern volatile long nmL2ZeroFaceSkip;
+
+// ReconstructNavMesh gave up on a Havok allocation failure and freed everything
+// it had taken. Reported as reconFail= on the stats line.
+extern volatile long nmReconFailCount;
+
+// Meshes that came back with zero faces, whether freshly generated or read out
+// of an old L2 file. A generation that aborts (a Havok keycode, out of memory)
+// is indistinguishable from a legitimately empty tile at this level, and
+// caching one makes that tile permanently empty, so at NMFIX_STEP >= 1 none of
+// them are stored or served. Reported as zeroFace= on the stats line.
+extern volatile long nmZeroFaceCount;
+extern volatile long nmZeroFaceLastTri;
+extern volatile long nmZeroFaceLastVert;
+extern volatile long nmZeroFaceLastThings;
+extern volatile long nmZeroFaceLastGridX;
+extern volatile long nmZeroFaceLastGridY;
+extern volatile long nmZeroFaceLastType;
+
+// The split Round 2 decides the L2 rule on: zero faces out of an empty input is
+// a legitimately empty tile, zero faces out of a real input is an aborted
+// generation. Reported as zfEmptyIn= and zfAbort=.
+extern volatile long nmZeroFaceEmptyInput;
+extern volatile long nmZeroFaceAbort;
+
+// Records one zero-face mesh. inputTri is the generation's input triangle
+// count, captured by the populate hook (-1 when it is unknown, e.g. a mesh read
+// back from an L2 file); inputThings is the zone's things count, or -1.
+// Safe on any thread.
+void NoteZeroFaceMesh(const NavMeshCacheKey& key, int inputTri, int inputVert, int inputThings);
+
+// Disk cache directory (initialized by InitNavMeshCacheCS, used by nm_disk_cache).
+// nmDiskCacheDirBuf is the char copy the bg threads use — no CRT string objects
+// off the main thread. Both end with a trailing backslash.
 extern std::string   nmDiskCacheDir;
+extern char          nmDiskCacheDirBuf[MAX_PATH];
 extern bool          nmDiskCacheDirChecked;
 
 
@@ -112,7 +318,16 @@ void           InitNavMeshCacheCS();
 void           ClearNavMeshCache();
 int            FindCacheEntry(const NavMeshCacheKey& key);
 void           EvictCacheEntry(int idx);
-void           StoreCacheEntry(const NavMeshCacheKey& key, uintptr_t navMeshPtr);
+// Deep-copies the generated mesh into the ring buffer. Returns the slot index,
+// or -1 when the mesh is out of bounds or an allocation failed (nothing is
+// stored in that case — never a valid entry with a NULL array, ZO-03).
+// Caller must hold nmCacheCS.
+int            StoreCacheEntry(const NavMeshCacheKey& key, uintptr_t navMeshPtr);
+
+// Moves a freshly read L2 entry into the ring buffer and returns its slot
+// index, or -1 (the entry's arrays are freed) when it is inconsistent.
+// Takes ownership of `e` on success. Caller must hold nmCacheCS.
+int            PromoteDiskEntryToL1(NavMeshCacheEntry& e);
 void*          ReconstructNavMesh(const NavMeshCacheEntry& entry);
 unsigned int   HashAABB(const float* aabb6);
 unsigned int   ComputeBuildingHash(uintptr_t jobZone);

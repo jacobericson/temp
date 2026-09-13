@@ -37,25 +37,27 @@ void ProbeNavMeshSettings(uintptr_t nmg)
 	InterlockedExchange(&nmSettingsDumped, 2);
 }
 
-// All values in Havok units (= Kenshi world units / 10)
-void ApplyNavMeshQualityTuning(uintptr_t nmg)
+// Writes NM_QUALITY_SETTINGS (nm_quality.h) onto the work buffer. That same
+// table feeds the L2 settings hash, so the disk cache key always describes what
+// was actually generated. wb+76 is EdgeMatchingParameters and wb+336 is
+// SimplificationSettings; the table's comments name each field.
+void ApplyNavMeshQualitySettings(uintptr_t wb)
 {
-	uintptr_t wb = *(uintptr_t*)(nmg + 256);
 	if (!wb) return;
 
-	// wb+76 = EdgeMatchingParameters
-	*(float*)(wb + 80) = 0.25f;   // m_maxSeparation (was 0.2)
-	*(float*)(wb + 92) = 0.985f;  // m_cosPlanarAlignmentAngle (was 0.99619, ~5deg -> ~10deg)
+	for (int i = 0; i < NM_QUALITY_SETTING_COUNT; ++i)
+	{
+		const NavMeshQualitySetting& s = NM_QUALITY_SETTINGS[i];
+		if (s.isInt)
+			*(int*)(wb + s.wbOffset) = (int)s.value;
+		else
+			*(float*)(wb + s.wbOffset) = s.value;
+	}
+}
 
-	// wb+336 = SimplificationSettings
-	*(float*)(wb + 344) = 0.15f;  // m_minCorridorWidth (was 0.4)
-	*(float*)(wb + 348) = 1.2f;   // m_maxCorridorWidth (was 0.6)
-
-	// wb+328 = m_minCharacterWidth (was 0.9)
-	*(float*)(wb + 328) = 0.5f;
-
-	// wb+136 = m_edgeConnectionIterations (was 2 -> 4 passes total)
-	*(int*)(wb + 136) = 3;
+void ApplyNavMeshQualityTuning(uintptr_t nmg)
+{
+	ApplyNavMeshQualitySettings(*(uintptr_t*)(nmg + 256));
 }
 
 void VerifyNavMeshSettings(uintptr_t nmg)
@@ -106,6 +108,8 @@ void ProbeWorkBufferSize(uintptr_t nmg)
 		// Scan for access fault boundary (true allocation size)
 		int lastNonZero = 0;
 		int lastReadable = 0;
+		// B7: the fault that ends this scan is the result, not a crash.
+		GuardEnter();
 		for (int off = 0; off < 65536; off += 8)
 		{
 			__try
@@ -117,6 +121,7 @@ void ProbeWorkBufferSize(uintptr_t nmg)
 			}
 			__except(EXCEPTION_EXECUTE_HANDLER) { break; }
 		}
+		GuardLeave();
 		InterlockedExchange(&probeWBFieldScan, lastNonZero);
 		InterlockedExchange(&probeWBHeapSize, lastReadable);
 
@@ -125,6 +130,8 @@ void ProbeWorkBufferSize(uintptr_t nmg)
 		// hkArray scanner: find all arrays in the workBuffer
 		int scanLimit = lastReadable;
 		int arrayCount = 0;
+		// B7: same — the scan is expected to run off the end of the buffer.
+		GuardEnter();
 		for (int off = 0; off + 16 <= scanLimit && arrayCount < WB_MAX_ARRAYS; off += 8)
 		{
 			__try
@@ -147,6 +154,7 @@ void ProbeWorkBufferSize(uintptr_t nmg)
 			}
 			__except(EXCEPTION_EXECUTE_HANDLER) { break; }
 		}
+		GuardLeave();
 
 		// Always include known intermediate arrays (may be zeroed after finalize)
 		int knownWritable[] = { 240, 256, 520 };

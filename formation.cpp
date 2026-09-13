@@ -8,6 +8,9 @@
 #include "tracking.h"        // watchedChars[] + gid helpers
 #include "pathfind_cache.h"  // spcSlots[] formation dedup cache
 #endif
+#if ISLAND_STEP >= 3
+#include "islands.h"          // IslandNudgeAwayFromLastDest, (a) discriminator trace
+#endif
 
 // State needed by pathfinding priority boost (PATHFIND_STEP >= 2)
 #if !defined(ZONEOPT_ZONEONLY) || PATHFIND_STEP >= 2
@@ -34,8 +37,106 @@ bool scatterPatchApplied = false;
 // code path, giving everyone the exact click destination (zero scatter).
 // Arrival scatter is handled separately by PollFormationGroups.
 
+// Forward declaration only (defined in hooks.cpp, H2's file): needed below to
+// recognise our own detour at RVA_ADD_ORDER_SELECTED. Not included via
+// hooks.h to avoid pulling in preload.h/tracking.h for one address.
+extern void hook_addOrderSelected(void* thisPI, void* destIndoors, int task,
+                                   void* subject, bool shift, bool addDontClear,
+                                   const float* location);
+
+// Round 2 review (optional minor): the file's guarded-read pattern
+// (core.cpp's ReadGameBytes16 -- __try/__except with GuardEnter/GuardLeave,
+// core.h, so the fault never reaches the crash recorder) for the FF 25
+// pointer-slot dereference below. Standalone and POD-only on purpose: MSVC
+// 2010 rejects __try in a function that also holds objects needing
+// unwinding, and ApplyScatterPatch uses std::ostringstream.
+static bool ReadPointerGuarded(const void* addr, uintptr_t* out)
+{
+	bool ok = true;
+	GuardEnter();
+	__try
+	{
+		*out = *(const uintptr_t*)addr;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		ok = false;
+	}
+	GuardLeave();
+	return ok;
+}
+
 bool ApplyScatterPatch()
 {
+	// B1: VerifyPrologue still runs below and is still fatal on a genuine
+	// mismatch or a genuine foreign hook -- nothing here weakens that check.
+	//
+	// "addOrderSelected" is also an UNCONDITIONAL row in g_hookPrologues
+	// (game.cpp): main.cpp's build-gate loop verifies it against the game's
+	// own, unhooked prologue before any hook installs, and a mismatch there
+	// refuses every install (this one included) before startPlugin gets this
+	// far. By the time ApplyScatterPatch runs, our own addOrderSelected hook
+	// is already installed at this RVA -- main.cpp only calls us when
+	// orig_addOrderSelected is non-NULL -- so the first bytes here are USUALLY
+	// our own detour, not the game's. Re-running VerifyPrologueByRva on our
+	// own detour finds it, and (correctly, by its own contract) reports it as
+	// "already hooked by another plugin" -- which is misleading when the
+	// detour is ours. Distinguish the two: only skip the redundant re-check
+	// when the immediate jump target is our own hook_addOrderSelected; a
+	// foreign detour (another plugin hooked first, ours chained after) or any
+	// unrecognised prologue still goes through the full check.
+	//
+	// Both detour shapes core.cpp's VerifyPrologue/DetourLength recognise:
+	// 5-byte `E9 rel32` (near jump) and 6-byte `FF 25 rel32` (RIP-relative
+	// indirect jump through an 8-byte pointer -- MinHook uses this one when
+	// the target is out of E9's +/-2GB range). DetourLength itself is `static`
+	// in core.cpp (internal linkage, not exported via core.h) and only
+	// classifies detour length for a tail-match, it does not resolve a
+	// target, so there is nothing there to call into for the second half of
+	// this check; duplicating the ~10-line decode here (rather than exporting
+	// a Layer-0 helper from a file six other Round 2 worktrees also touch)
+	// keeps this fix inside the files this task owns.
+	bool ownDetour = false;
+	{
+		unsigned char* site = (unsigned char*)(gameBase + RVA_ADD_ORDER_SELECTED);
+		uintptr_t target = 0;
+		bool haveTarget = false;
+		if (site[0] == 0xE9)
+		{
+			int rel32 = *(int*)(site + 1);
+			target = (uintptr_t)(site + 5) + (uintptr_t)rel32;
+			haveTarget = true;
+		}
+		else if (site[0] == 0xFF && site[1] == 0x25)
+		{
+			int rel32 = *(int*)(site + 2);
+			uintptr_t ptrAddr = (uintptr_t)(site + 6) + (uintptr_t)rel32;
+			// FF 25 rel32 = jmp qword ptr [rip+rel32]: the target is the
+			// 8-byte value stored AT ptrAddr, not ptrAddr itself. Guarded: on
+			// an unexpected binary layout ptrAddr is an arbitrary computed
+			// address, not something VerifyPrologueByRva has vetted yet.
+			uintptr_t ptrValue = 0;
+			if (ReadPointerGuarded((const void*)ptrAddr, &ptrValue))
+			{
+				target = ptrValue;
+				haveTarget = true;
+			}
+		}
+		if (haveTarget)
+			ownDetour = (target == (uintptr_t)&hook_addOrderSelected);
+	}
+
+	if (ownDetour)
+	{
+		LogMsg("[ZoneOpt] Scatter patch: addOrderSelected already carries our own "
+		       "hook (prologue verified by the build gate at startup); skipping "
+		       "the redundant re-check");
+	}
+	else if (!VerifyPrologueByRva(RVA_ADD_ORDER_SELECTED))
+	{
+		return false;
+	}
+
 	uintptr_t funcBase = gameBase + RVA_ADD_ORDER_SELECTED;
 	const int funcSize = 1714;
 	unsigned char* funcBytes = (unsigned char*)funcBase;
@@ -402,19 +503,34 @@ void CreateFormationGroup(const float* dest, uintptr_t* chars, int charCount)
 // Formation group polling
 // =========================================================================
 
+// Retire one group slot, including the PATHFIND_STEP 7 squad-cache bookkeeping
+// that every other deactivation site performs.
+static void DeactivateFormationGroup(int g)
+{
+#if PATHFIND_STEP >= 7
+	ClearFormationGroupIdForSlot(g);
+	spcSlots[g].formationExitUpdateTime = 0.0;
+	spcSlots[g].formationExitGX         = -1;
+	spcSlots[g].formationExitGY         = -1;
+#endif
+	formationGroups[g].active = false;
+}
+
 void PollFormationGroups()
 {
 	double now = ElapsedSec();
 
-	// Read playerCharacters lektor once for validation
+	// Read playerCharacters lektor once for validation. Without a readable list
+	// no member can be validated, and no member may be dereferenced unvalidated,
+	// so the whole poll is skipped for this frame. Groups keep their state and
+	// are polled again as soon as the list comes back.
 	uintptr_t playerIntf = *(uintptr_t*)(gameBase + RVA_GLOBAL_PLAYER);
-	unsigned int scCount = 0;
-	uintptr_t* scStuff = NULL;
-	if (playerIntf)
-	{
-		scCount = GetPlayerCharCount(playerIntf);
-		scStuff = GetPlayerCharStuff(playerIntf);
-	}
+	if (!playerIntf)
+		return;
+	unsigned int scCount = GetPlayerCharCount(playerIntf);
+	uintptr_t* scStuff   = GetPlayerCharStuff(playerIntf);
+	if (!scStuff || scCount == 0 || scCount > 200)
+		return;
 
 	for (int g = 0; g < MAX_FORMATION_GROUPS; ++g)
 	{
@@ -422,6 +538,47 @@ void PollFormationGroups()
 			continue;
 
 		FormationGroup& grp = formationGroups[g];
+
+		// Liveness pass (B9). Groups live up to FORMATION_TIMEOUT seconds, so a
+		// mid-session save load — or any character leaving the squad — can leave
+		// members pointing at freed Character objects. Validate every member
+		// against the live player list BEFORE anything below dereferences
+		// mem.character (the timeout count, the "Running Together" check and the
+		// phase bodies all read it). A member that is gone is dropped from the
+		// group; if the leader (member 0) is gone, the whole group is retired.
+		// The list is known readable here: PollFormationGroups returns above
+		// otherwise, so nothing below ever dereferences an unvalidated member.
+		{
+			bool leaderGone = false;
+			int aliveMembers = 0;
+			for (int m = 0; m < grp.count; ++m)
+			{
+				if (!grp.members[m].character) continue;
+
+				bool alive = false;
+				for (unsigned int j = 0; j < scCount; ++j)
+				{
+					if (scStuff[j] == grp.members[m].character) { alive = true; break; }
+				}
+				if (!alive)
+				{
+					grp.members[m].character    = 0;
+					grp.members[m].charMovement = 0;
+					if (m == 0) leaderGone = true;
+					continue;
+				}
+				aliveMembers++;
+			}
+			if (leaderGone || aliveMembers == 0)
+			{
+				std::ostringstream ss;
+				ss << "[ZoneOpt] Formation group dropped: "
+				   << (leaderGone ? "leader" : "all members") << " no longer in the player list";
+				LogMsg(ss.str());
+				DeactivateFormationGroup(g);
+				continue;
+			}
+		}
 
 		// Stale timeout
 		if (now - grp.createdTime > FORMATION_TIMEOUT)
@@ -756,6 +913,15 @@ bool FormationReissueTravel(int slot, double now)
 	// Same dispatch as the gather->travel transition in PollFormationGroups.
 	int sent = 0;
 	int nudged = 0;
+#if ISLAND_STEP >= 3
+	// (a): one line per member, or (group larger than 6) one summary line
+	// plus only the members whose post is not "sent". Round 2 fix 2a: the
+	// results are resolved 1 s later from IslandTick (islands.cpp), so the
+	// summary is tracked there as a dispatch: every member recorded below
+	// joins it, and the summary prints once all of them have resolved or been
+	// dropped. traceDispatch is -1 outside summary mode.
+	int traceDispatch = IslandBeginReissueDispatch(slot, grp.count > 6);
+#endif
 	for (int m = 0; m < grp.count; ++m)
 	{
 		FormationMember& mem = grp.members[m];
@@ -765,6 +931,16 @@ bool FormationReissueTravel(int slot, double now)
 		for (unsigned int j = 0; j < scCount; ++j)
 			if (scStuff[j] == mem.character) { alive = true; break; }
 		if (!alive) { mem.character = 0; continue; }
+
+#if ISLAND_STEP >= 3
+		// Round 1 review, Important #1 backstop: never send a member a second
+		// move order within one cooldown window (e.g. it was already
+		// re-issued solo this cycle via the (c) per-member path in
+		// PollOrders, and the representative then parked too in the same or
+		// very next poll).
+		if (IslandRecentlyReissued(mem.character, now))
+			continue;
+#endif
 
 		uintptr_t charVtable = *(uintptr_t*)mem.character;
 		if (!charVtable) continue;
@@ -778,6 +954,19 @@ bool FormationReissueTravel(int slot, double now)
 		// last requested destination while it is routing to an island edge.
 		// Every member received the exact grp.dest (scatter patch), so nudge.
 		uintptr_t cm = *(uintptr_t*)(mem.character + OFF_CHAR_MOVEMENT);
+#if ISLAND_STEP >= 3
+		// (a)/(b): capture the pre-call trace and use the direction-aware nudge.
+		IslandReissueTrace trace;
+		IslandCaptureReissueTrace(mem.character, &trace);
+		if (cm)
+		{
+			float lx = *(float*)(cm + OFF_CMOV_LAST_DEST);
+			float lz = *(float*)(cm + OFF_CMOV_LAST_DEST + 8);
+			IslandNudgeAwayFromLastDest(lx, lz, &destPos[0], &destPos[2]);
+			if (destPos[0] != grp.destX || destPos[2] != grp.destZ)
+				nudged++;
+		}
+#else
 		if (cm)
 		{
 			float lx = *(float*)(cm + OFF_CMOV_LAST_DEST);
@@ -789,10 +978,47 @@ bool FormationReissueTravel(int slot, double now)
 				nudged++;
 			}
 		}
+#endif
 
 		fn_moveOrder(mem.character, NULL, NULL, destPos);
 		sent++;
+
+#if ISLAND_STEP >= 3
+		// Round 2 review, Important #1 residual: stamp every member this
+		// dispatch actually reached (representative included -- ReissueOrder
+		// stamps the same field on the representative's own entry right
+		// after this call returns, so this is a harmless duplicate write
+		// there, not a second timestamp source). A member whose own order is
+		// swallowed by this blast still carries a fresh cooldown, so the
+		// PollOrders (c) solo path defers its own reissue until the cooldown
+		// clears instead of firing immediately on its first fresh park check.
+		IslandMarkReissued(mem.character, now);
+
+		{
+			std::ostringstream label;
+			// Fix round 1 (review Important #1): the char@<hex low 16 bits>
+			// suffix (same form as the solo label, and PLAYER TASK's char=@)
+			// ties a member's result to that character's PLAYER TASK lines;
+			// the "group N member M" prefix is kept for existing greps.
+			label << "group " << slot << " member " << m
+			      << " char@" << std::hex << (mem.character & 0xFFFF) << std::dec;
+			std::string labelStr = label.str();
+
+			// Round 2 fix 2a: record, do not classify. fn_moveOrder is applied
+			// asynchronously, so +0xDC read here still holds the previous
+			// destination; islands.cpp classifies (IslandClassifyReissuePost,
+			// the single owner of post=) and logs 1 s later.
+			IslandRecordReissueCheck(mem.character, labelStr.c_str(), destPos[0], destPos[2],
+			                         trace, now, traceDispatch);
+		}
+#endif
 	}
+
+#if ISLAND_STEP >= 3
+	// Close the dispatch (every Begin needs its End, even with nothing sent:
+	// an empty dispatch is freed without a line, as before).
+	IslandEndReissueDispatch(traceDispatch);
+#endif
 
 	if (sent == 0) return false;
 	grp.lastReissueTime = now;

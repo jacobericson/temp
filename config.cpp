@@ -20,12 +20,33 @@ bool groupCohesionEnabled  = true;
 #endif
 #if PATHFIND_STEP >= 1
 bool pathfindDiagEnabled   = true;
+#ifdef ZONEOPT_SQUAD_CACHE
 bool squadPathCacheEnabled = false;  // Report 4 CTD: injection is unsafe. INI squadPathCache=true is for Phase 16 staging only.
+#endif
 #endif
 #if PATHFIND_STEP >= 2
 bool stuckRetryEnabled     = false;  // Log stalled movement without replacing orders by default.
 #endif
 bool islandFixEnabled      = true;   // islandFix=false keeps the island hooks passing through (A/B control)
+#ifdef ZONEOPT_DEBUG
+bool destroyListDiagEnabled = true;  // destroyListDiag: inserter thread-id hook on in DEV,
+#else
+bool destroyListDiagEnabled = false; //   off in PROD (see config.h).
+#endif
+bool destroyListDeferEnabled = true; // destroyListDefer: crash-3 mitigation, on everywhere (config.h).
+bool saveLoadUnloadEnabled = true;   // saveLoadUnload: Round 2 save-load crash fix, on everywhere (config.h).
+bool islandReadinessRuleEnabled = false; // islandReadinessRule: Round 2 H2 A/B key (config.h).
+bool readinessOverridesEnabled = true;   // readinessOverrides: Round 2 H2/Z control (config.h).
+#ifdef ZONEOPT_DEBUG
+bool npcWaitDiagEnabled = true;   // npcWaitDiag: Phase 17 Step 1 diagnostic, on in DEV,
+#else
+bool npcWaitDiagEnabled = false;  //   off in PROD (see config.h).
+#endif
+#ifdef ZONEOPT_DEBUG
+bool gatePassDiagEnabled = true;  // gatePassDiag: Phase 17 Step 1 diagnostic, on in DEV,
+#else
+bool gatePassDiagEnabled = false; //   off in PROD (see config.h).
+#endif
 
 
 // =========================================================================
@@ -34,6 +55,7 @@ bool islandFixEnabled      = true;   // islandFix=false keeps the island hooks p
 
 // Zone loading
 float  cfg_preloadThreshold      = 2500.0f;
+float  cfg_preloadKeepAliveSeconds = 0.0f;
 int    cfg_cameraReserved        = 12;
 
 // Character tracking
@@ -50,6 +72,11 @@ float  cfg_gatherRadiusSq        = 1600.0f;
 
 // NavMesh workers
 int    cfg_navmeshWorkerCount    = 3;
+int    g_navMeshWorkerCount      = 3;
+
+// NavMesh L2 disk cache
+int    cfg_navmeshDiskCacheMaxMB = 512;
+unsigned int g_modSetHash        = 0;
 
 // Hook orchestration
 double cfg_camLogInterval        = 10.0;
@@ -180,11 +207,102 @@ static int ClampInt(const char* name, int val, int lo, int hi)
 
 
 // =========================================================================
+// Active mod set hash (ZO-11)
+// =========================================================================
+//
+// mods.cfg (under the game's data folder) lists the active mods in load order,
+// one per line.
+// Mods can move terrain and buildings, so a changed mod set must not reuse the
+// navmesh meshes of the old one. The hash goes into every L2 filename, which
+// also keeps two mod sets' caches side by side instead of fighting over the
+// same names. Read once here, on the main thread at startup.
+//
+// The game's own list (GameWorld::activeMods, lektor<ModInfo*> at +0x528) is
+// not used: it needs a GameWorld pointer and is not populated this early.
+static unsigned int ComputeModSetHash(std::string& usedPath)
+{
+	char exePath[MAX_PATH];
+	char path[MAX_PATH];
+	FILE* f = NULL;
+
+	usedPath.clear();
+
+	// Candidates in order. Kenshi keeps the file at <game root>\data\mods.cfg;
+	// a copy in the game root itself does not exist on every install, so that
+	// is only the second try. Both are then repeated relative to the DLL, which
+	// lives at <game root>\mods\<folder>\, for launchers that start the
+	// executable from somewhere else.
+	std::string candidates[4];
+	int nCand = 0;
+
+	// _TRUNCATE keeps an over-long path from reaching the secure CRT's
+	// invalid-parameter handler, which would terminate the process; it returns
+	// -1 instead and the next candidate takes over.
+	DWORD n = GetModuleFileNameA(NULL, exePath, MAX_PATH);
+	if (n > 0 && n < MAX_PATH)
+	{
+		char* slash = strrchr(exePath, '\\');
+		if (slash)
+		{
+			slash[1] = 0;
+			if (_snprintf_s(path, sizeof(path), _TRUNCATE, "%sdata\\mods.cfg", exePath) >= 0)
+				candidates[nCand++] = path;
+			if (_snprintf_s(path, sizeof(path), _TRUNCATE, "%smods.cfg", exePath) >= 0)
+				candidates[nCand++] = path;
+		}
+	}
+
+	std::string dllDir = GetDLLDirectory();
+	candidates[nCand++] = dllDir + "..\\..\\data\\mods.cfg";
+	candidates[nCand++] = dllDir + "..\\..\\mods.cfg";
+
+	for (int i = 0; i < nCand && !f; ++i)
+	{
+		fopen_s(&f, candidates[i].c_str(), "rb");
+		if (f)
+			usedPath = candidates[i];
+	}
+
+	if (!f)
+		return 0;
+
+	unsigned int h = 2166136261u;
+	unsigned char buf[4096];
+	size_t got;
+	while ((got = fread(buf, 1, sizeof(buf), f)) > 0)
+	{
+		for (size_t i = 0; i < got; ++i)
+		{
+			if (buf[i] == '\r') continue;   // normalize line endings
+			h ^= buf[i];
+			h *= 16777619u;
+		}
+	}
+	fclose(f);
+
+	if (h == 0) h = 1;   // 0 is reserved for "mod list unavailable"
+	return h;
+}
+
+
+// =========================================================================
 // LoadConfig — reads KenshiZoneOpt.ini, applies values with validation
 // =========================================================================
 
 void LoadConfig(const std::string& dllDir)
 {
+	std::string modsCfgPath;
+	g_modSetHash = ComputeModSetHash(modsCfgPath);
+	{
+		std::ostringstream ss;
+		ss << "[ZoneOpt] Active mod set hash: " << std::hex << g_modSetHash << std::dec;
+		if (g_modSetHash == 0)
+			ss << " (mods.cfg not found — L2 cache keyed without it)";
+		else
+			ss << " (from " << modsCfgPath << ")";
+		LogMsg(ss.str());
+	}
+
 	std::string iniPath = dllDir + "KenshiZoneOpt.ini";
 	FILE* f = NULL;
 	fopen_s(&f, iniPath.c_str(), "r");
@@ -226,16 +344,27 @@ void LoadConfig(const std::string& dllDir)
 #endif
 #if PATHFIND_STEP >= 1
 		else if (key == "pathfindDiag")   { bool b; if (ParseBool(val, &b)) { pathfindDiagEnabled = b; matched = true; } }
+#ifdef ZONEOPT_SQUAD_CACHE
 		else if (key == "squadPathCache") { bool b; if (ParseBool(val, &b)) { squadPathCacheEnabled = b; matched = true; } }
+#endif
 #endif
 #if PATHFIND_STEP >= 2
 		else if (key == "stuckRetry")     { bool b; if (ParseBool(val, &b)) { stuckRetryEnabled = b; matched = true; } }
 #endif
 		else if (key == "islandFix")      { bool b; if (ParseBool(val, &b)) { islandFixEnabled = b; matched = true; } }
+		else if (key == "destroyListDiag") { bool b; if (ParseBool(val, &b)) { destroyListDiagEnabled = b; matched = true; } }
+		else if (key == "destroyListDefer") { bool b; if (ParseBool(val, &b)) { destroyListDeferEnabled = b; matched = true; } }
+		else if (key == "saveLoadUnload") { bool b; if (ParseBool(val, &b)) { saveLoadUnloadEnabled = b; matched = true; } }
+		else if (key == "islandReadinessRule") { bool b; if (ParseBool(val, &b)) { islandReadinessRuleEnabled = b; matched = true; } }
+		else if (key == "readinessOverrides") { bool b; if (ParseBool(val, &b)) { readinessOverridesEnabled = b; matched = true; } }
+		else if (key == "npcWaitDiag")    { bool b; if (ParseBool(val, &b)) { npcWaitDiagEnabled = b; matched = true; } }
+		else if (key == "gatePassDiag")   { bool b; if (ParseBool(val, &b)) { gatePassDiagEnabled = b; matched = true; } }
 
 		// --- Tuning parameters ---
 		else if (key == "preloadThreshold")
 			{ float v; if (ParseFloat(val, &v)) { cfg_preloadThreshold = v; matched = true; } }
+		else if (key == "preloadKeepAliveSeconds")
+			{ float v; if (ParseFloat(val, &v)) { cfg_preloadKeepAliveSeconds = v; matched = true; } }
 		else if (key == "edgeThreshold")
 			{ float v; if (ParseFloat(val, &v)) { cfg_edgeThreshold = v; matched = true; } }
 		else if (key == "charScanInterval")
@@ -254,6 +383,8 @@ void LoadConfig(const std::string& dllDir)
 			{ float v; if (ParseFloat(val, &v)) { cfg_gatherRadiusSq = v; matched = true; } }
 		else if (key == "navmeshWorkerCount")
 			{ int v; if (ParseInt(val, &v)) { cfg_navmeshWorkerCount = v; matched = true; } }
+		else if (key == "navmeshDiskCacheMaxMB")
+			{ int v; if (ParseInt(val, &v)) { cfg_navmeshDiskCacheMaxMB = v; matched = true; } }
 		else if (key == "camLogInterval")
 			{ double v; if (ParseDouble(val, &v)) { cfg_camLogInterval = v; matched = true; } }
 		else if (key == "reprioritizeInterval")
@@ -297,6 +428,7 @@ void LoadConfig(const std::string& dllDir)
 
 	// --- Validate and clamp ---
 	cfg_preloadThreshold      = ClampFloat("preloadThreshold", cfg_preloadThreshold, 500.0f, 4000.0f);
+	cfg_preloadKeepAliveSeconds = ClampFloat("preloadKeepAliveSeconds", cfg_preloadKeepAliveSeconds, 0.0f, 86400.0f);
 	cfg_edgeThreshold         = ClampFloat("edgeThreshold", cfg_edgeThreshold, 200.0f, 2300.0f);
 	cfg_charScanInterval      = ClampDouble("charScanInterval", cfg_charScanInterval, 0.5, 30.0);
 	cfg_baselineScanInterval  = ClampDouble("baselineScanInterval", cfg_baselineScanInterval, 1.0, 60.0);
@@ -306,6 +438,8 @@ void LoadConfig(const std::string& dllDir)
 	cfg_scatterApproachDistSq = ClampFloat("scatterApproachDistSq", cfg_scatterApproachDistSq, 100.0f, 40000.0f);
 	cfg_gatherRadiusSq        = ClampFloat("gatherRadiusSq", cfg_gatherRadiusSq, 100.0f, 40000.0f);
 	cfg_navmeshWorkerCount    = ClampInt("navmeshWorkerCount", cfg_navmeshWorkerCount, 1, NAVMESH_WORKER_COUNT);
+	g_navMeshWorkerCount      = cfg_navmeshWorkerCount;
+	cfg_navmeshDiskCacheMaxMB = ClampInt("navmeshDiskCacheMaxMB", cfg_navmeshDiskCacheMaxMB, 32, 8192);
 	cfg_camLogInterval        = ClampDouble("camLogInterval", cfg_camLogInterval, 1.0, 300.0);
 	cfg_reprioritizeInterval  = ClampDouble("reprioritizeInterval", cfg_reprioritizeInterval, 1.0, 30.0);
 	cfg_evictInterval         = ClampDouble("evictInterval", cfg_evictInterval, 0.5, 30.0);
@@ -334,6 +468,17 @@ void LoadConfig(const std::string& dllDir)
 		std::ostringstream ss;
 		ss << "[ZoneOpt] Config: formationTimeout raised to " << cfg_formationTimeout
 		   << " (must exceed gatherTimeout + 5)";
+		LogMsg(ss.str());
+	}
+
+	// Always reported, default included: it changes when the game unloads the
+	// zones the mod preloads, so any log read against a crash needs to state it.
+	{
+		std::ostringstream ss;
+		ss << "[ZoneOpt] Config: preloadKeepAliveSeconds=" << cfg_preloadKeepAliveSeconds
+		   << (cfg_preloadKeepAliveSeconds > 0.0f
+		       ? " (overrides the game's per-timer default)"
+		       : " (the game's per-timer default)");
 		LogMsg(ss.str());
 	}
 

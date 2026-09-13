@@ -804,10 +804,20 @@ void IslandRequestRebuild()
 	g_rebuildRequested = true;
 }
 
+#if ISLAND_STEP >= 3
+// Round 2 fix 2a: pending re-issue checks hold raw Character pointers; a save
+// load frees every character, so the table goes with the rest of the state
+// (defined with the tracker, below).
+static void ResetReissueChecks();
+#endif
+
 void IslandReset()
 {
 	ResetBuilder();
 	g_builderZm = 0;
+#if ISLAND_STEP >= 3
+	ResetReissueChecks();
+#endif
 }
 
 
@@ -932,6 +942,13 @@ bool IslandDescribeStuck(void* zoneMgr, uintptr_t charMov,
 
 #if ISLAND_STEP >= 3
 
+// Forward-declared: PollOrders / IsCharacterParkedNow (below, inside the
+// anonymous namespace) need it for the (b) stopped-form order-type check.
+// Defined further down (still file-static), next to the rest of the (a)
+// discriminator-trace API -- it is internal to this file, never exposed via
+// islands.h.
+static int ReadCharOrderType(uintptr_t character);
+
 namespace {
 
 const int    MAX_ISLAND_ORDERS   = 64;
@@ -944,6 +961,12 @@ const float  UNPARK_DIST         = 50.0f;
 const int    MAX_REISSUES        = 8;
 const double REISSUE_COOLDOWN    = 2.0;
 const double RETRY_DELAY         = 1.5;
+// (c) Round 2 final review, Important #1: the stopped form of the park test
+// (stoppedParked, below) must hold continuously for this long before it
+// counts as parked -- a single bad poll (mid-frame state change, a
+// still-settling order) must not park a character about to move again. The
+// edge form keeps its existing (unhysteresised) behaviour.
+const double STOPPED_HYSTERESIS  = 3.0;
 
 struct IslandOrder {
 	bool      active;
@@ -951,6 +974,7 @@ struct IslandOrder {
 	float     destX, destY, destZ;
 	double    orderTime;
 	bool      parked;
+	bool      parkedViaStop;   // (e): parked via the stop()-ed test, not the edge test
 	float     parkX, parkZ;
 	int       parkGX, parkGY;
 	double    parkTime;
@@ -964,6 +988,7 @@ struct IslandOrder {
 	unsigned int seenGen;
 	unsigned int seenSig;
 	bool      noCrossingLogged;
+	double    stoppedSince;    // (c): 0.0 = stopped predicate not currently holding
 };
 
 IslandOrder   g_orders[MAX_ISLAND_ORDERS];
@@ -977,7 +1002,243 @@ void ResetOrders()
 	g_orderCount = 0;
 }
 
-bool ReissueCharacter(uintptr_t character, float dx, float dy, float dz)
+
+// -------------------------------------------------------------------------
+// Round 2 fix 2a: the tracker's "still a live player character" test.
+//
+// Factored out of PollOrders, whose behaviour is unchanged: a character is
+// live while it appears in PlayerInterface's playerCharacters lektor
+// (RVA_GLOBAL_PLAYER -> count +0x2B8 / data +0x2C0, game.h), read with the
+// same sanity bounds PollOrders always used (non-null data, 1..200 entries).
+// A character that leaves the squad, or is freed by a save load, drops out of
+// that list; PollOrders drops its IslandOrder on exactly this test ("squad
+// removal"), and the pending re-issue checks below use it before they touch a
+// stored Character pointer.
+// -------------------------------------------------------------------------
+
+// false = no usable list (no PlayerInterface, null data, count 0 or > 200).
+static bool TrackerPlayerList(uintptr_t** outStuff, unsigned int* outCount)
+{
+	*outStuff = NULL;
+	*outCount = 0;
+	uintptr_t playerIntf = *(uintptr_t*)(gameBase + RVA_GLOBAL_PLAYER);
+	if (!playerIntf) return false;
+	unsigned int scCount = GetPlayerCharCount(playerIntf);
+	uintptr_t* scStuff = GetPlayerCharStuff(playerIntf);
+	if (!scStuff || scCount == 0 || scCount > 200) return false;
+	*outStuff = scStuff;
+	*outCount = scCount;
+	return true;
+}
+
+// Pointer comparison only: never dereferences `character`.
+static bool TrackerListHas(const uintptr_t* stuff, unsigned int count, uintptr_t character)
+{
+	for (unsigned int j = 0; j < count; ++j)
+		if (stuff[j] == character) return true;
+	return false;
+}
+
+static bool TrackerIsLivePlayerCharacter(uintptr_t character)
+{
+	uintptr_t* stuff;
+	unsigned int count;
+	if (!TrackerPlayerList(&stuff, &count)) return false;
+	return TrackerListHas(stuff, count, character);
+}
+
+
+// -------------------------------------------------------------------------
+// Round 2 fix 2a: deferred (a) discriminator (main thread only).
+//
+// fn_moveOrder (playerMoveOrderDefault, vtable+0x318) hands the order to the
+// AI task system, which applies it asynchronously, so a same-tick read of
+// +0xDC always saw the previous destination. Each re-issue records a pending
+// check here; ResolveDueReissueChecks (from IslandTick, every frame) resolves
+// it at the first tick at least REISSUE_RESULT_DELAY after the order.
+//
+// REISSUE_RESULT_DELAY is below REISSUE_COOLDOWN, and both tracker paths
+// (ReissueOrder's own-entry cooldown, FormationReissueTravel's
+// IslandRecentlyReissued skip) enforce the cooldown per character, so the
+// tracker cannot send the same character a newer order before its check
+// resolves. IslandRecordReissueCheck still handles that case (a player click
+// resets IslandOrder.lastReissueTime via IslandNoteOrder).
+// -------------------------------------------------------------------------
+
+const double REISSUE_RESULT_DELAY   = 1.0;   // must stay < REISSUE_COOLDOWN (2.0)
+// One pending check per character at most (a newer order resolves the old
+// one). Checks come from solo IslandOrders (MAX_ISLAND_ORDERS = 64) AND from
+// every member of a group dispatch (8 groups x 30 members), which are not
+// IslandOrders, so 64 could overflow when several large squads park at once.
+// 256 covers 64 solo + 8 x 30 members with room; a full table still resolves
+// its oldest check early (counted as reissueCheckEarly=).
+const int    MAX_REISSUE_CHECKS     = 256;
+const int    MAX_REISSUE_DISPATCHES = 16;    // 2x MAX_FORMATION_GROUPS (group cooldown 2 s > delay 1 s)
+const int    REISSUE_LABEL_LEN      = 40;    // "group 7 member 29 char@ffff", "char@ffff"
+
+struct ReissueCheck {
+	bool      active;
+	uintptr_t character;     // key only: never dereferenced before the live test
+	char      label[REISSUE_LABEL_LEN];
+	float     sentX, sentZ;  // destination handed to fn_moveOrder (after the nudge)
+	IslandReissueTrace pre;  // captured immediately before fn_moveOrder
+	double    issueTime;
+	int       dispatch;      // g_reissueDispatches index, -1 = prints its own line
+	int       overtaken;     // IslandOvertakeReason bits (islands.h), 0 = none
+};
+
+// One summary-mode FormationReissueTravel call (group above 6 members).
+struct ReissueDispatch {
+	bool active;
+	bool closed;    // IslandEndReissueDispatch ran: no more members will be recorded
+	int  slot;      // formation group slot, for the summary line
+	int  total;     // members recorded (dropped ones included)
+	int  sent;      // members resolved with post=sent
+	int  pending;   // members recorded and not yet resolved or dropped
+};
+
+static ReissueCheck    g_reissueChecks[MAX_REISSUE_CHECKS];
+static int             g_reissueCheckActive = 0;
+static ReissueDispatch g_reissueDispatches[MAX_REISSUE_DISPATCHES];
+
+// Islands: summary-line counters (cumulative for the session, main thread).
+static long g_reissuePostSent     = 0;
+static long g_reissuePostLast     = 0;
+static long g_reissuePostOther    = 0;
+static long g_reissueCheckDropped = 0;
+static long g_reissueCheckEarly   = 0;   // resolved before the delay because the table was full
+
+// Prints the summary line and frees the dispatch once it is closed and every
+// member has resolved or been dropped. A dispatch that recorded nobody
+// (FormationReissueTravel sent no member) is freed without a line, as before.
+static void FinishDispatchIfDone(int d)
+{
+	if (d < 0 || d >= MAX_REISSUE_DISPATCHES) return;
+	ReissueDispatch& rd = g_reissueDispatches[d];
+	if (!rd.active || !rd.closed || rd.pending > 0) return;
+	if (rd.total > 0)
+	{
+		std::ostringstream ss;
+		ss << "[ZoneOpt] Island reissue result: group " << rd.slot
+		   << " summary " << rd.sent << "/" << rd.total << " sent";
+		LogMsg(ss.str());
+	}
+	rd.active = false;
+}
+
+// Resolves one pending check with the character's CURRENT state and frees its
+// slot. `live` is the caller's TrackerIsLivePlayerCharacter answer: when it
+// is false the stored pointer is never dereferenced -- the entry is dropped
+// silently and counted (reissueCheckDropped=), and a summary-mode member
+// still counts toward its dispatch's total, not its sent.
+static void ResolveReissueCheck(ReissueCheck& c, double now, bool live)
+{
+	int d = c.dispatch;
+	bool inDispatch = (d >= 0 && d < MAX_REISSUE_DISPATCHES && g_reissueDispatches[d].active);
+
+	if (!live)
+	{
+		g_reissueCheckDropped++;
+	}
+	else
+	{
+		uintptr_t character = c.character;
+		uintptr_t cm = *(uintptr_t*)(character + OFF_CHAR_MOVEMENT);
+		float wpX = 0.0f, wpZ = 0.0f;
+		int edge = 0, ctr = 0, ps = 0, hc136 = 0;
+		bool haveMoved = false;
+		float moved = 0.0f;
+		if (cm)
+		{
+			wpX   = *(float*)(cm + OFF_CMOV_PATH_DEST);
+			wpZ   = *(float*)(cm + OFF_CMOV_PATH_DEST + 8);
+			edge  = *(unsigned char*)(cm + OFF_CMOV_MOVING_TO_EDGE);
+			ctr   = *(int*)(cm + OFF_CMOV_EDGE_COUNTER);
+			uintptr_t hc = *(uintptr_t*)(cm + OFF_CMOV_HAVOK_CHAR);
+			if (hc)
+			{
+				ps    = *(int*)(hc + OFF_HC_PATH_STATE);
+				hc136 = *(int*)(hc + OFF_HC_ARRIVAL);
+			}
+			// moved=: straight-line distance between the CharMovement position
+			// (+0xC4, OFF_CMOV_POS -- the vector CharMovement::stop() 0x65F1E0
+			// copies into +0xDC/+0xE8) captured before fn_moveOrder and now.
+			if (c.pre.valid)
+			{
+				float mx = *(float*)(cm + OFF_CMOV_POS)     - c.pre.posX;
+				float mz = *(float*)(cm + OFF_CMOV_POS + 8) - c.pre.posZ;
+				moved = sqrtf(mx * mx + mz * mz);
+				haveMoved = true;
+			}
+		}
+
+		// The existing rule, unchanged (single owner of post=).
+		IslandReissuePost cls = IslandClassifyReissuePost(character, c.sentX, c.sentZ, c.pre);
+		if (cls == ISLAND_POST_SENT)      g_reissuePostSent++;
+		else if (cls == ISLAND_POST_LAST) g_reissuePostLast++;
+		else                              g_reissuePostOther++;
+		if (inDispatch && cls == ISLAND_POST_SENT)
+			g_reissueDispatches[d].sent++;
+
+		// Summary mode keeps its behaviour: per-member lines only for results
+		// that are not post=sent.
+		if (!inDispatch || cls != ISLAND_POST_SENT)
+		{
+			const char* post = (cls == ISLAND_POST_SENT) ? "sent" : (cls == ISLAND_POST_LAST) ? "last" : "other";
+			float ddx = c.pre.lastX - c.sentX, ddz = c.pre.lastZ - c.sentZ;
+			float dist = sqrtf(ddx * ddx + ddz * ddz);
+			double dtSec = now - c.issueTime;
+			int dtMs = (int)(dtSec * 1000.0 + 0.5);
+
+			std::ostringstream ss;
+			ss << std::fixed << std::setprecision(1);
+			ss << "[ZoneOpt] Island reissue result: " << c.label
+			   << " post=" << post << " d=" << dist
+			   << " order=" << c.pre.orderType
+			   << " edge=" << c.pre.edge << "/" << c.pre.edgeCtr << "->" << edge << "/" << ctr
+			   << " wp=(" << c.pre.wpX << "," << c.pre.wpZ << ")->(" << wpX << "," << wpZ << ")"
+			   << " ps=" << c.pre.hcPathState << "->" << ps
+			   << " hc136=" << c.pre.hcArrival << "->" << hc136
+			   << " dt=" << dtMs
+			   << " moved=";
+			if (haveMoved) ss << moved;
+			else           ss << "-";
+			if (c.overtaken & ISLAND_OVERTAKEN_CLICK) ss << " click=1";
+			if (c.overtaken & ISLAND_OVERTAKEN_RETRY) ss << " retry=1";
+			LogMsg(ss.str());
+		}
+	}
+
+	c.active = false;
+	c.character = 0;
+	g_reissueCheckActive--;
+	if (inDispatch)
+	{
+		g_reissueDispatches[d].pending--;
+		FinishDispatchIfDone(d);
+	}
+}
+
+// IslandTick, every frame (main thread): resolve every check whose delay has
+// elapsed. One player-list read per call; each check is tested against it
+// before its pointer is used.
+static void ResolveDueReissueChecks(double now)
+{
+	if (g_reissueCheckActive <= 0) return;
+	uintptr_t* stuff = NULL;
+	unsigned int count = 0;
+	bool haveList = TrackerPlayerList(&stuff, &count);
+	for (int i = 0; i < MAX_REISSUE_CHECKS; ++i)
+	{
+		ReissueCheck& c = g_reissueChecks[i];
+		if (!c.active) continue;
+		if (now - c.issueTime < REISSUE_RESULT_DELAY) continue;
+		bool live = haveList && TrackerListHas(stuff, count, c.character);
+		ResolveReissueCheck(c, now, live);
+	}
+}
+
+bool ReissueCharacter(uintptr_t character, float dx, float dy, float dz, double now)
 {
 	uintptr_t charVtable = *(uintptr_t*)character;
 	if (!charVtable) return false;
@@ -989,29 +1250,48 @@ bool ReissueCharacter(uintptr_t character, float dx, float dy, float dz)
 	uintptr_t cm = *(uintptr_t*)(character + OFF_CHAR_MOVEMENT);
 	if (cm)
 	{
-		// Edge mode drops a re-issue whose destination is within 2 units of
-		// the last requested one (+0xDC). Nudge it by 3 units.
+		// (b) Direction-aware nudge: CharMovement::setDestination_Vec3 drops a
+		// re-issue within 2 units of the last requested destination (+0xDC)
+		// while routing to an island edge. Push away from +0xDC by >= 8 units
+		// instead of the old fixed, one-sided +3 on x.
 		float lx = *(float*)(cm + OFF_CMOV_LAST_DEST);
 		float lz = *(float*)(cm + OFF_CMOV_LAST_DEST + 8);
-		float ddx = lx - dx, ddz = lz - dz;
-		if (ddx * ddx + ddz * ddz < 4.0f)
-			dest[0] += 3.0f;
+		IslandNudgeAwayFromLastDest(lx, lz, &dest[0], &dest[2]);
 	}
+
+	// (a) Discriminator line: capture state immediately before fn_moveOrder,
+	// call it, and record a pending check that IslandTick resolves
+	// REISSUE_RESULT_DELAY later (the order is applied asynchronously, so a
+	// same-tick read cannot tell whether it took effect). character's low 16
+	// bits give distinct log tags without a meaningful per-character index
+	// available at this call site.
+	IslandReissueTrace trace;
+	IslandCaptureReissueTrace(character, &trace);
 	fn_moveOrder(character, NULL, NULL, dest);
+	{
+		std::ostringstream label;
+		label << "char@" << std::hex << (character & 0xFFFF) << std::dec;
+		std::string labelStr = label.str();
+		IslandRecordReissueCheck(character, labelStr.c_str(), dest[0], dest[2], trace, now, -1);
+	}
 	return true;
 }
 
-bool ReissueOrder(IslandOrder& o, double now, const char* why, bool haveCross, float cx, float cz)
+bool ReissueOrder(IslandOrder& o, double now, const char* why, bool haveCross, float cx, float cz,
+                  bool forceCharacterOnly)
 {
 	if (o.reissueCount >= MAX_REISSUES) return false;
 	if (o.lastReissueTime > 0.0 && now - o.lastReissueTime < REISSUE_COOLDOWN) return false;
 
 	bool sent;
-	int slot = FormationSlotForCharacter(o.character);
+	// (c): a member being re-issued alone (its group's representative is not
+	// parked) always goes through the character path, even though it belongs
+	// to an active formation group.
+	int slot = forceCharacterOnly ? -1 : FormationSlotForCharacter(o.character);
 	if (slot >= 0)
 		sent = FormationReissueTravel(slot, now);
 	else
-		sent = ReissueCharacter(o.character, o.destX, o.destY, o.destZ);
+		sent = ReissueCharacter(o.character, o.destX, o.destY, o.destZ, now);
 	if (!sent) return false;
 
 	o.reissueCount++;
@@ -1022,9 +1302,15 @@ bool ReissueOrder(IslandOrder& o, double now, const char* why, bool haveCross, f
 
 	std::ostringstream ss;
 	ss << std::fixed << std::setprecision(0);
-	ss << "[ZoneOpt] Island reissue (" << why << "): "
-	   << (slot >= 0 ? "group " : "char ") << (slot >= 0 ? slot : 0)
-	   << " park=(" << o.parkX << "," << o.parkZ << ")";
+	ss << "[ZoneOpt] Island reissue (" << why << (o.parkedViaStop ? " stopped" : "") << "): ";
+	// Name the character the same way the (a) result lines do (char@<hex>)
+	// instead of the old hardcoded "char 0", so this line and the matching
+	// "Island reissue result" line correlate by label.
+	if (slot >= 0)
+		ss << "group " << slot;
+	else
+		ss << "char@" << std::hex << (o.character & 0xFFFF) << std::dec;
+	ss << " park=(" << o.parkX << "," << o.parkZ << ")";
 	if (haveCross) ss << " cross=(" << cx << "," << cz << ")";
 	ss << " dest=(" << o.destX << "," << o.destZ << ")"
 	   << " n=" << o.reissueCount << "/" << MAX_REISSUES;
@@ -1038,33 +1324,107 @@ inline float Dist2(float ax, float az, float bx, float bz)
 	return dx * dx + dz * dz;
 }
 
+// (c) Round 2 final review: IsCharacterParkedNow (below) needs somewhere to
+// hold the stopped-form hysteresis clock for a character it did not itself
+// receive an IslandOrder& for (it is called with a representative's raw
+// character pointer). The representative is a selected character of the
+// same order, so it already has its own g_orders[] entry; look it up and
+// share the exact same stoppedSince field PollOrders's own loop iteration
+// for that entry would use. Returns NULL if the character has no active
+// entry (never called from anywhere the caller's own entry can't apply,
+// but callable defensively).
+IslandOrder* FindOrderForCharacter(uintptr_t character)
+{
+	for (int i = 0; i < g_orderCount; ++i)
+		if (g_orders[i].active && g_orders[i].character == character)
+			return &g_orders[i];
+	return NULL;
+}
+
+// Round 1 review, Important #1: live park test for ANY character, used to
+// check a formation representative's CURRENT CharMovement state directly
+// rather than through its (possibly not-yet-updated-this-tick) IslandOrder
+// flag. g_orders[k].parked is only as fresh as the last time that entry's
+// own loop iteration ran; querying live state instead removes the
+// dependency on which index runs first within one PollOrders() pass, so a
+// representative and a member parking "together" can never see different
+// answers to "is the representative parked" within the same tick.
+bool IsCharacterParkedNow(uintptr_t character, float destX, float destZ, double now)
+{
+	if (!character) return false;
+	uintptr_t cm = *(uintptr_t*)(character + OFF_CHAR_MOVEMENT);
+	if (!cm) return false;
+
+	float posX = *(float*)(cm + OFF_CMOV_POS);
+	float posZ = *(float*)(cm + OFF_CMOV_POS + 8);
+	if (Dist2(posX, posZ, destX, destZ) < PARK_MIN_DEST_DIST * PARK_MIN_DEST_DIST)
+		return false;   // arrived, not parked
+
+	float lastX = *(float*)(cm + OFF_CMOV_LAST_DEST);
+	float lastZ = *(float*)(cm + OFF_CMOV_LAST_DEST + 8);
+	float wpX   = *(float*)(cm + OFF_CMOV_PATH_DEST);
+	float wpZ   = *(float*)(cm + OFF_CMOV_PATH_DEST + 8);
+	bool edge   = *(unsigned char*)(cm + OFF_CMOV_MOVING_TO_EDGE) != 0;
+
+	bool edgeParked = edge && Dist2(wpX, wpZ, posX, posZ) < PARK_WP_DIST * PARK_WP_DIST;
+
+	// (b) The stopped form only fires while the character's cached order is
+	// still the move order the tracker watches (ORDER_TYPE_MOVE) -- a later
+	// non-move order already dropped the IslandOrder in hook_addOrderSelected
+	// (item (a)), but a stale move order can also be replaced in place
+	// (combat AI, a knockout, task completion) without going through that hook.
+	bool stoppedPredicate = !edge
+	                      && ReadCharOrderType(character) == ORDER_TYPE_MOVE
+	                      && Dist2(lastX, lastZ, posX, posZ) < 100.0f    // |+0xDC - pos| < 10
+	                      && Dist2(wpX, wpZ, posX, posZ) < 400.0f;       // |+0xE8 - pos| < 20
+
+	// (c) Same 3s hysteresis as PollOrders's own stopped test, applied here so
+	// the live representative check cannot park a character faster than that
+	// character's own loop iteration would. If this character has no tracked
+	// IslandOrder (should not happen for a representative -- see above -- but
+	// checked defensively), the stopped form never parks it here.
+	bool stoppedParked = false;
+	IslandOrder* ord = FindOrderForCharacter(character);
+	if (ord)
+	{
+		if (stoppedPredicate)
+		{
+			if (ord->stoppedSince <= 0.0) ord->stoppedSince = now;
+			stoppedParked = (now - ord->stoppedSince) >= STOPPED_HYSTERESIS;
+		}
+		else
+		{
+			ord->stoppedSince = 0.0;
+		}
+	}
+	return edgeParked || stoppedParked;
+}
+
 void PollOrders(uintptr_t zm, double now)
 {
 	if (now - g_lastOrderPoll < ORDER_POLL_INTERVAL) return;
 	g_lastOrderPoll = now;
 	if (g_orderCount == 0 || !gridCalibrated) return;
 
-	uintptr_t playerIntf = *(uintptr_t*)(gameBase + RVA_GLOBAL_PLAYER);
-	if (!playerIntf) return;
-	unsigned int scCount = GetPlayerCharCount(playerIntf);
-	uintptr_t* scStuff = GetPlayerCharStuff(playerIntf);
-	if (!scStuff || scCount == 0 || scCount > 200) return;
+	uintptr_t* scStuff;
+	unsigned int scCount;
+	if (!TrackerPlayerList(&scStuff, &scCount)) return;
 
 	for (int i = 0; i < g_orderCount; ++i)
 	{
 		IslandOrder& o = g_orders[i];
 		if (!o.active) continue;
 
-		bool alive = false;
-		for (unsigned int j = 0; j < scCount; ++j)
-			if (scStuff[j] == o.character) { alive = true; break; }
-		if (!alive) { o.active = false; continue; }
+		// Squad removal: the tracker's live-player-character test.
+		if (!TrackerListHas(scStuff, scCount, o.character)) { o.active = false; continue; }
 
 		uintptr_t cm = *(uintptr_t*)(o.character + OFF_CHAR_MOVEMENT);
 		if (!cm) continue;
 
 		float posX = *(float*)(cm + OFF_CMOV_POS);
 		float posZ = *(float*)(cm + OFF_CMOV_POS + 8);
+		float lastX = *(float*)(cm + OFF_CMOV_LAST_DEST);
+		float lastZ = *(float*)(cm + OFF_CMOV_LAST_DEST + 8);
 		float wpX  = *(float*)(cm + OFF_CMOV_PATH_DEST);
 		float wpZ  = *(float*)(cm + OFF_CMOV_PATH_DEST + 8);
 		bool edge  = *(unsigned char*)(cm + OFF_CMOV_MOVING_TO_EDGE) != 0;
@@ -1075,12 +1435,51 @@ void PollOrders(uintptr_t zm, double now)
 			continue;
 		}
 
-		// A formation group is evaluated once, through its first alive member.
+		// (c) A formation group is normally evaluated once, through its first
+		// alive member. A member of a GATHERED group whose own park test holds
+		// while the representative is not parked is evaluated -- and, if
+		// needed, re-issued -- on its own, instead of being invisible until
+		// the group's 120s timeout (Round 1 session 5's left-behind member).
 		int slot = FormationSlotForCharacter(o.character);
+		bool forceCharacterOnly = false;
 		if (slot >= 0)
 		{
 			uintptr_t rep = FormationFirstAliveMember(slot);
-			if (rep && rep != o.character) continue;
+			if (rep && rep != o.character)
+			{
+				// Still gathering: this member is mid-approach to the leader,
+				// not stranded en route. Leave it to the group logic.
+				if (!formationGroups[slot].gathered) continue;
+
+				// Round 1 review, Important #1: read the representative's
+				// CURRENT CharMovement state directly instead of its
+				// IslandOrder.parked flag, which is only as fresh as the last
+				// time THAT entry's own loop iteration ran. A scan-order
+				// dependency there let a member (processed before the
+				// representative's own entry, in a tick where both park
+				// together) see a stale "not parked" answer, take the solo
+				// path, and then get a second order moments later from the
+				// representative's own group-wide re-issue in the SAME tick.
+				// Every rep of this same order shares o.destX/Y/Z (the click
+				// destination, per IslandNoteOrder), so the live test uses it
+				// directly -- no g_orders[] lookup, no ordering dependency.
+				if (IsCharacterParkedNow(rep, o.destX, o.destZ, now)) continue;   // the group-wide re-issue covers it
+
+				// Round 2 review, Important #1 residual (group-then-solo
+				// cross-tick): a group dispatch stamps THIS member's own
+				// cooldown (IslandMarkReissued, formation.cpp) without ever
+				// touching o.parked, so a member whose order was swallowed by
+				// the group blast reaches this point with o.parked still
+				// false. Evaluating it now would run the fresh park-entry
+				// branch below and call ReissueOrder immediately -- exactly
+				// the second order within REISSUE_COOLDOWN the review flagged.
+				// Defer the whole solo evaluation (not just the send) until
+				// the cooldown clears: leaving o.parked false here means the
+				// park-entry branch runs uninterrupted once it does, so the
+				// rescue still happens, just ~2s after the group's own order.
+				if (IslandRecentlyReissued(o.character, now)) continue;
+				forceCharacterOnly = true;
+			}
 		}
 
 		int gx, gy;
@@ -1094,7 +1493,33 @@ void PollOrders(uintptr_t zm, double now)
 			if (ddx > 1 || ddy > 1) { o.reissueCount = 0; o.limitGX = gx; o.limitGY = gy; }
 		}
 
-		bool parkedNow = edge && Dist2(wpX, wpZ, posX, posZ) < PARK_WP_DIST * PARK_WP_DIST;
+		// (e) stop()-ed characters count as parked too: edge already 0,
+		// getDestination() (+0xDC) and pathDestination (+0xE8) both collapsed
+		// onto pos, and (checked above) more than 100 units from the order
+		// destination with an active order entry.
+		//
+		// (b) Round 2 final review: the stopped form additionally requires the
+		// character's cached order to still be the move order this entry is
+		// tracking. A later non-move player order already drops the entire
+		// IslandOrder in hook_addOrderSelected (item (a)); this catches an
+		// in-place replacement of the same move order (combat AI, a knockout,
+		// task completion) that never goes through that hook.
+		//
+		// (c) The stopped form must also hold continuously for
+		// STOPPED_HYSTERESIS before it counts as parked, so one bad poll (a
+		// still-settling order, a momentary state change) can't park a
+		// character that is about to move again. o.stoppedSince resets to 0
+		// the instant the predicate fails; IsCharacterParkedNow (above) shares
+		// this same field for the live representative check.
+		bool edgeParked = edge && Dist2(wpX, wpZ, posX, posZ) < PARK_WP_DIST * PARK_WP_DIST;
+		bool stoppedPredicate = !edge
+		                      && ReadCharOrderType(o.character) == ORDER_TYPE_MOVE
+		                      && Dist2(lastX, lastZ, posX, posZ) < 100.0f   // |+0xDC - pos| < 10
+		                      && Dist2(wpX, wpZ, posX, posZ) < 400.0f;      // |+0xE8 - pos| < 20
+		if (stoppedPredicate) { if (o.stoppedSince <= 0.0) o.stoppedSince = now; }
+		else                  { o.stoppedSince = 0.0; }
+		bool stoppedParked = stoppedPredicate && (now - o.stoppedSince >= STOPPED_HYSTERESIS);
+		bool parkedNow = edgeParked || stoppedParked;
 		uintptr_t charZone = (uintptr_t)GetZoneEntry((void*)zm, gx, gy);
 		if (!charZone) continue;
 
@@ -1104,6 +1529,7 @@ void PollOrders(uintptr_t zm, double now)
 
 			// --- park: record the fixed ray dest -> parkPos and emulate X0 ---
 			o.parked = true;
+			o.parkedViaStop = !edgeParked && stoppedParked;
 			o.parkX = posX; o.parkZ = posZ;
 			o.parkGX = gx; o.parkGY = gy;
 			o.parkTime = now;
@@ -1121,7 +1547,7 @@ void PollOrders(uintptr_t zm, double now)
 				o.x0X = rx; o.x0Z = rz;
 				// Missed advance: the island already reaches past the waypoint.
 				if (Dist2(rx, rz, o.parkX, o.parkZ) > MISSED_ADVANCE_DIST * MISSED_ADVANCE_DIST)
-					ReissueOrder(o, now, "park", true, rx, rz);
+					ReissueOrder(o, now, "park", true, rx, rz, forceCharacterOnly);
 			}
 			else
 			{
@@ -1129,6 +1555,7 @@ void PollOrders(uintptr_t zm, double now)
 				std::ostringstream ss;
 				ss << std::fixed << std::setprecision(0);
 				ss << "[ZoneOpt] Island reissue skipped: no crossing"
+				   << (o.parkedViaStop ? " stopped" : "")
 				   << " park=(" << o.parkX << "," << o.parkZ << ") zone=(" << gx << "," << gy << ")"
 				   << " dest=(" << o.destX << "," << o.destZ << ")";
 				LogMsg(ss.str());
@@ -1149,7 +1576,9 @@ void PollOrders(uintptr_t zm, double now)
 			if (!o.retryArmed)
 			{
 				// Edge flag dropped (a new route was accepted) or the router
-				// advanced the waypoint: wait for the character to move.
+				// advanced the waypoint: wait for the character to move. For a
+				// stop()-ed park (e) `edge` is already 0, so this only un-parks
+				// when the distance tests themselves cleared, i.e. it moved.
 				if (!edge) o.parked = false;
 				continue;
 			}
@@ -1174,7 +1603,7 @@ void PollOrders(uintptr_t zm, double now)
 			{
 				if (have && Dist2(rx, rz, o.x0X, o.x0Z) > GROWTH_THRESHOLD_SQ)
 				{
-					if (ReissueOrder(o, now, "growth", true, rx, rz))
+					if (ReissueOrder(o, now, "growth", true, rx, rz, forceCharacterOnly))
 					{
 						o.x0X = rx; o.x0Z = rz;
 						continue;
@@ -1185,7 +1614,7 @@ void PollOrders(uintptr_t zm, double now)
 			{
 				// A crossing appeared on the fixed ray: island growth.
 				if (Dist2(rx, rz, o.parkX, o.parkZ) > GROWTH_THRESHOLD_SQ)
-					ReissueOrder(o, now, "growth", true, rx, rz);
+					ReissueOrder(o, now, "growth", true, rx, rz, forceCharacterOnly);
 				o.haveX0 = true;
 				o.x0X = rx; o.x0Z = rz;
 				continue;
@@ -1196,7 +1625,7 @@ void PollOrders(uintptr_t zm, double now)
 		// (for example, the readiness gate swallowed the order).
 		if (retryDue && have && Dist2(rx, rz, o.retryX, o.retryZ) <= GROWTH_THRESHOLD_SQ)
 		{
-			if (!ReissueOrder(o, now, "retry", true, rx, rz))
+			if (!ReissueOrder(o, now, "retry", true, rx, rz, forceCharacterOnly))
 			{
 				if (o.reissueCount >= MAX_REISSUES) o.retryArmed = false;
 			}
@@ -1211,6 +1640,10 @@ void PollOrders(uintptr_t zm, double now)
 void IslandNoteOrder(uintptr_t character, const float* location)
 {
 	if (!character || !location) return;
+	// Fix round 1 (review Minor #4): a player move order landing inside a
+	// pending re-issue check's 1 s window is flagged (click=1 on the result
+	// line), not resolved early.
+	IslandFlagReissueOvertaken(character, ISLAND_OVERTAKEN_CLICK);
 	int slot = -1;
 	for (int i = 0; i < g_orderCount; ++i)
 	{
@@ -1230,6 +1663,262 @@ void IslandNoteOrder(uintptr_t character, const float* location)
 	o.destY = location[1];
 	o.destZ = location[2];
 	o.orderTime = ElapsedSec();
+}
+
+// (a) Round 2 final review, Important #1: called from hook_addOrderSelected
+// for every selected character of a NON-move (task != 29) player order. An
+// IslandOrder otherwise only clears on arrival, squad removal, a save load or
+// a new move order -- so a later attack/job/pick-up/talk order, AI combat, or
+// a knockout left the OLD move destination active, and the stopped-park test
+// (e) would eventually re-issue that stale destination to a character the
+// player deliberately redirected. Dropping the entry here removes it from the
+// tracker outright (matches "clears on ... a new move order": a new NON-move
+// order also ends the old move order's relevance).
+void IslandDropOrder(uintptr_t character)
+{
+	if (!character) return;
+	for (int i = 0; i < g_orderCount; ++i)
+	{
+		if (g_orders[i].active && g_orders[i].character == character)
+		{
+			g_orders[i].active = false;
+			break;
+		}
+	}
+}
+
+
+// =========================================================================
+// (a) Discriminator trace: shared by ReissueCharacter (this file) and
+// FormationReissueTravel (formation.cpp). Main thread only.
+// =========================================================================
+
+// Current order type from Character::playerMoveOrderDefault's (0x5D1820)
+// cached-order chain (game.h). Every link is null-checked; -1 = no cached
+// order (or any link is null), meaning the fresh-AddOrder path always runs.
+static int ReadCharOrderType(uintptr_t character)
+{
+	if (!character) return -1;
+	uintptr_t p = *(uintptr_t*)(character + OFF_CHAR_PENDING_TASK_PTR);
+	if (!p) return -1;
+	uintptr_t pendingTask = *(uintptr_t*)(p + OFF_PENDING_TASK_HEAD_OFF);
+	if (!pendingTask) return -1;
+	uintptr_t orderObj = *(uintptr_t*)(pendingTask + OFF_PENDING_TASK_ORDER_OFF);
+	if (!orderObj) return -1;
+	return *(int*)(orderObj + OFF_ORDER_TYPE);
+}
+
+void IslandCaptureReissueTrace(uintptr_t character, IslandReissueTrace* out)
+{
+	if (!out) return;
+	memset(out, 0, sizeof(*out));
+	out->orderType = -1;
+	if (!character) return;
+
+	uintptr_t cm = *(uintptr_t*)(character + OFF_CHAR_MOVEMENT);
+	if (cm)
+	{
+		out->lastX   = *(float*)(cm + OFF_CMOV_LAST_DEST);
+		out->lastZ   = *(float*)(cm + OFF_CMOV_LAST_DEST + 8);
+		out->wpX     = *(float*)(cm + OFF_CMOV_PATH_DEST);
+		out->wpZ     = *(float*)(cm + OFF_CMOV_PATH_DEST + 8);
+		out->posX    = *(float*)(cm + OFF_CMOV_POS);
+		out->posZ    = *(float*)(cm + OFF_CMOV_POS + 8);
+		out->edge    = *(unsigned char*)(cm + OFF_CMOV_MOVING_TO_EDGE);
+		out->edgeCtr = *(int*)(cm + OFF_CMOV_EDGE_COUNTER);
+		uintptr_t hc = *(uintptr_t*)(cm + OFF_CMOV_HAVOK_CHAR);
+		if (hc)
+		{
+			out->hcPathState = *(int*)(hc + OFF_HC_PATH_STATE);
+			out->hcArrival   = *(int*)(hc + OFF_HC_ARRIVAL);
+		}
+		out->valid = true;
+	}
+	out->orderType = ReadCharOrderType(character);
+}
+
+// Round 1 review, Important #3: the single owner of post=sent|last|other.
+// post=sent (order went through), post=last (dropped -- d<=2 is the edge-mode
+// 2-unit guard, d>2 is the in-place order-29 branch, item (6)), post=other
+// (anything else, e.g. a mis-projected crossing).
+IslandReissuePost IslandClassifyReissuePost(uintptr_t character, float sentX, float sentZ,
+                                            const IslandReissueTrace& pre)
+{
+	if (!character) return ISLAND_POST_OTHER;
+	uintptr_t cm = *(uintptr_t*)(character + OFF_CHAR_MOVEMENT);
+	if (!cm) return ISLAND_POST_OTHER;
+
+	float postX = *(float*)(cm + OFF_CMOV_LAST_DEST);
+	float postZ = *(float*)(cm + OFF_CMOV_LAST_DEST + 8);
+
+	float sdx = postX - sentX, sdz = postZ - sentZ;
+	if (sdx * sdx + sdz * sdz <= 0.25f) return ISLAND_POST_SENT;   // within 0.5 units
+
+	float ldx = postX - pre.lastX, ldz = postZ - pre.lastZ;
+	if (ldx * ldx + ldz * ldz <= 0.25f) return ISLAND_POST_LAST;
+
+	return ISLAND_POST_OTHER;
+}
+
+// Round 2 fix 2a: record a pending check (see islands.h). Main thread only.
+void IslandRecordReissueCheck(uintptr_t character, const char* label,
+                              float sentX, float sentZ,
+                              const IslandReissueTrace& pre, double now, int dispatch)
+{
+	if (!character) return;
+
+	// A newer order recorded for a character that still has a pending check:
+	// resolve the old one first, with the current state. The new order was
+	// just handed to the asynchronous AI task system, so what is read here is
+	// still what the old order left (its dt= shows it resolved early). The
+	// tracker's own cooldown (2 s > the 1 s delay) normally rules this out; a
+	// player click in between resets IslandOrder.lastReissueTime, so it can
+	// still happen.
+	for (int i = 0; i < MAX_REISSUE_CHECKS; ++i)
+	{
+		ReissueCheck& c = g_reissueChecks[i];
+		if (c.active && c.character == character)
+			ResolveReissueCheck(c, now, TrackerIsLivePlayerCharacter(character));
+	}
+
+	int slot = -1;
+	for (int i = 0; i < MAX_REISSUE_CHECKS; ++i)
+	{
+		if (!g_reissueChecks[i].active) { slot = i; break; }
+	}
+	if (slot < 0)
+	{
+		// Table full (256 checks pending inside one second). Resolve the
+		// oldest early, with the current state, rather than lose this order's
+		// line; dt= shows it and reissueCheckEarly= counts it.
+		int oldest = 0;
+		for (int i = 1; i < MAX_REISSUE_CHECKS; ++i)
+			if (g_reissueChecks[i].issueTime < g_reissueChecks[oldest].issueTime) oldest = i;
+		g_reissueCheckEarly++;
+		ResolveReissueCheck(g_reissueChecks[oldest], now,
+		                    TrackerIsLivePlayerCharacter(g_reissueChecks[oldest].character));
+		slot = oldest;
+	}
+
+	ReissueCheck& c = g_reissueChecks[slot];
+	c.active = true;
+	c.character = character;
+	int n = 0;
+	if (label)
+		for (; label[n] && n < REISSUE_LABEL_LEN - 1; ++n) c.label[n] = label[n];
+	c.label[n] = '\0';
+	if (n == 0) { c.label[0] = '?'; c.label[1] = '\0'; }
+	c.sentX = sentX;
+	c.sentZ = sentZ;
+	c.pre = pre;
+	c.issueTime = now;
+	c.overtaken = 0;
+	c.dispatch = -1;
+	if (dispatch >= 0 && dispatch < MAX_REISSUE_DISPATCHES
+	    && g_reissueDispatches[dispatch].active && !g_reissueDispatches[dispatch].closed)
+	{
+		c.dispatch = dispatch;
+		g_reissueDispatches[dispatch].total++;
+		g_reissueDispatches[dispatch].pending++;
+	}
+	g_reissueCheckActive++;
+}
+
+// Fix round 1 (review Minor #4): mark `character`'s pending check, if any, as
+// overtaken by an order from outside the tracker. Pointer comparison only.
+void IslandFlagReissueOvertaken(uintptr_t character, int reason)
+{
+	if (!character || g_reissueCheckActive <= 0) return;
+	for (int i = 0; i < MAX_REISSUE_CHECKS; ++i)
+	{
+		ReissueCheck& c = g_reissueChecks[i];
+		if (c.active && c.character == character)
+		{
+			c.overtaken |= reason;
+			return;   // at most one pending check per character
+		}
+	}
+}
+
+int IslandBeginReissueDispatch(int slot, bool summaryMode)
+{
+	if (!summaryMode) return -1;
+	for (int d = 0; d < MAX_REISSUE_DISPATCHES; ++d)
+	{
+		ReissueDispatch& rd = g_reissueDispatches[d];
+		if (rd.active) continue;
+		rd.active  = true;
+		rd.closed  = false;
+		rd.slot    = slot;
+		rd.total   = 0;
+		rd.sent    = 0;
+		rd.pending = 0;
+		return d;
+	}
+	return -1;   // full: every member of this dispatch prints its own line
+}
+
+void IslandEndReissueDispatch(int dispatch)
+{
+	if (dispatch < 0 || dispatch >= MAX_REISSUE_DISPATCHES) return;
+	ReissueDispatch& rd = g_reissueDispatches[dispatch];
+	if (!rd.active) return;
+	rd.closed = true;
+	FinishDispatchIfDone(dispatch);   // frees at once when nothing was recorded
+}
+
+// Declared static above IslandReset. Called from IslandReset (save load,
+// preload.cpp ClearPreloadStateImpl) and from IslandTick's own save-load /
+// new-ZoneManager reset. Drops every pending check and dispatch without
+// reading any stored pointer.
+static void ResetReissueChecks()
+{
+	for (int i = 0; i < MAX_REISSUE_CHECKS; ++i)
+	{
+		g_reissueChecks[i].active = false;
+		g_reissueChecks[i].character = 0;
+	}
+	g_reissueCheckActive = 0;
+	for (int d = 0; d < MAX_REISSUE_DISPATCHES; ++d)
+		g_reissueDispatches[d].active = false;
+}
+
+// Round 1 review, Important #1 backstop: has `character` been re-issued
+// (solo or as a formation member) within REISSUE_COOLDOWN of `now`? Scans the
+// same g_orders[] the tracker itself maintains -- one entry per character,
+// written by IslandNoteOrder -- so this reflects every ReissueOrder call
+// regardless of which path (character or group) made it.
+bool IslandRecentlyReissued(uintptr_t character, double now)
+{
+	if (!character) return false;
+	for (int i = 0; i < g_orderCount; ++i)
+	{
+		if (g_orders[i].active && g_orders[i].character == character)
+		{
+			return g_orders[i].lastReissueTime > 0.0
+			    && now - g_orders[i].lastReissueTime < REISSUE_COOLDOWN;
+		}
+	}
+	return false;
+}
+
+// Round 2 review, Important #1 second residual: stamp ONLY lastReissueTime
+// (never reissueCount, never parked) so a group dispatch's cooldown is
+// visible to IslandRecentlyReissued/ReissueOrder for every member it touched,
+// without charging that member's own per-order budget or marking it parked --
+// per the controller's ruling, the (c) rescue must still be free to run its
+// own full park-detection once the cooldown clears.
+void IslandMarkReissued(uintptr_t character, double now)
+{
+	if (!character) return;
+	for (int i = 0; i < g_orderCount; ++i)
+	{
+		if (g_orders[i].active && g_orders[i].character == character)
+		{
+			g_orders[i].lastReissueTime = now;
+			return;
+		}
+	}
 }
 
 #endif // ISLAND_STEP >= 3
@@ -1258,6 +1947,7 @@ void IslandTick(void* zoneMgr, double now)
 			ResetBuilder();
 #if ISLAND_STEP >= 3
 			ResetOrders();
+			ResetReissueChecks();
 #endif
 			LogMsg(loading ? "[ZoneOpt] Islands: save load detected, overlay reset"
 			               : "[ZoneOpt] Islands: zone manager bound, overlay reset");
@@ -1279,6 +1969,10 @@ void IslandTick(void* zoneMgr, double now)
 				g_rebuildRequested = false;
 			}
 #if ISLAND_STEP >= 3
+			// Round 2 fix 2a: resolve the pending re-issue checks whose 1 s
+			// delay has elapsed, every frame, before PollOrders can send new
+			// orders this tick.
+			ResolveDueReissueChecks(now);
 			PollOrders(zm, now);
 #endif
 		}
@@ -1308,7 +2002,11 @@ void IslandTick(void* zoneMgr, double now)
 		if (g_markCount) ss << " marks=" << g_markCount;
 #endif
 #if ISLAND_STEP >= 3
-		ss << " reissue=" << InterlockedCompareExchange(&g_reissues, 0, 0);
+		ss << " reissue=" << InterlockedCompareExchange(&g_reissues, 0, 0)
+		   << " reissuePost=s" << g_reissuePostSent << "/l" << g_reissuePostLast
+		   << "/o" << g_reissuePostOther
+		   << " reissueCheckDropped=" << g_reissueCheckDropped
+		   << " reissueCheckEarly=" << g_reissueCheckEarly;
 #endif
 		AppendReadinessTids(ss);
 		LogDebug(ss.str());

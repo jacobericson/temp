@@ -23,6 +23,36 @@ double lastActivePoll    = 0.0;
 int hookOrderCount       = 0;
 
 
+#if PRELOAD_STEP >= 1
+// =========================================================================
+// H15 firstMove tracking (research/preload_pipeline.md; H15 in
+// docs/release_readiness.md)
+// =========================================================================
+// Armed by preload.cpp (H15ArmFirstMoveCheck) at the loading-screen dismissal.
+// Baseline positions are captured on PollActiveMovers's own next tick below,
+// reusing the walk it already performs over watchedChars -- no second pass.
+// So firstMove's zero point can trail the dismissal by up to
+// ACTIVE_POLL_INTERVAL (1s). gen ties a report to the benchmark that armed it;
+// preload.cpp drops a report whose gen no longer matches the live one.
+struct H15Baseline { uintptr_t character; float x; float z; bool valid; };
+static H15Baseline s_h15Baseline[MAX_WATCHED];
+static bool   s_h15Waiting      = false;
+static bool   s_h15NeedBaseline = false;
+static int    s_h15Gen          = 0;
+static double s_h15DismissTime  = 0.0;
+
+void H15ArmFirstMoveCheck(int gen, double dismissTime)
+{
+	s_h15Gen          = gen;
+	s_h15DismissTime  = dismissTime;
+	s_h15NeedBaseline = true;
+	s_h15Waiting      = true;
+	for (int i = 0; i < MAX_WATCHED; ++i)
+		s_h15Baseline[i].valid = false;
+}
+#endif
+
+
 // =========================================================================
 // Watched character helpers
 // =========================================================================
@@ -489,6 +519,14 @@ void PollActiveMovers(void* zoneMgr, double now)
 		scStuff = GetPlayerCharStuff(playerIntf);
 	}
 
+#if PRELOAD_STEP >= 1
+	// H15: this call captures the firstMove baseline (one poll tick, reusing
+	// this loop) when a benchmark was just armed and hasn't taken one yet.
+	bool h15CapturingBaseline = s_h15Waiting && s_h15NeedBaseline;
+	int    h15Gen      = s_h15Gen;
+	double h15Dismiss  = s_h15DismissTime;
+#endif
+
 	for (int i = numWatched - 1; i >= 0; --i)
 	{
 		uintptr_t character = watchedChars[i].character;
@@ -527,6 +565,46 @@ void PollActiveMovers(void* zoneMgr, double now)
 
 		float curX = GetCharPosX(character);
 		float curZ = GetCharPosZ(character);
+
+#if PRELOAD_STEP >= 1
+		if (s_h15Waiting)
+		{
+			if (h15CapturingBaseline)
+			{
+				int freeSlot = -1;
+				bool already = false;
+				for (int b = 0; b < MAX_WATCHED; ++b)
+				{
+					if (s_h15Baseline[b].valid && s_h15Baseline[b].character == character)
+					{ already = true; break; }
+					if (freeSlot < 0 && !s_h15Baseline[b].valid) freeSlot = b;
+				}
+				if (!already && freeSlot >= 0)
+				{
+					s_h15Baseline[freeSlot].character = character;
+					s_h15Baseline[freeSlot].x = curX;
+					s_h15Baseline[freeSlot].z = curZ;
+					s_h15Baseline[freeSlot].valid = true;
+				}
+			}
+			else
+			{
+				for (int b = 0; b < MAX_WATCHED; ++b)
+				{
+					if (!s_h15Baseline[b].valid || s_h15Baseline[b].character != character)
+						continue;
+					float ddx = curX - s_h15Baseline[b].x;
+					float ddz = curZ - s_h15Baseline[b].z;
+					if (ddx * ddx + ddz * ddz > 50.0f * 50.0f)
+					{
+						H15ReportFirstMove(h15Gen, (now - h15Dismiss) * 1000.0);
+						s_h15Waiting = false;
+					}
+					break;
+				}
+			}
+		}
+#endif
 
 		int curGX, curGY;
 		if (!WorldToZoneGrid(curX, curZ, &curGX, &curGY))
@@ -624,6 +702,11 @@ void PollActiveMovers(void* zoneMgr, double now)
 		}
 #endif
 	}
+
+#if PRELOAD_STEP >= 1
+	if (h15CapturingBaseline)
+		s_h15NeedBaseline = false;
+#endif
 
 	if (removals > 0 || edgePreloads > 0)
 	{

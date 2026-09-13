@@ -104,5 +104,15 @@ void SetFormationGroupIdOnMembers(int groupSlot, uintptr_t* chars, int charCount
 void ClearFormationGroupIdForSlot(int groupSlot);
 #endif
 
+#if PRELOAD_STEP >= 1
+// H15 firstMove tracking (research/preload_pipeline.md; H15 in
+// docs/release_readiness.md). Called from preload.cpp at the loading-screen
+// dismissal to arm a new benchmark generation; baseline positions are
+// captured on PollActiveMovers's own next tick (its existing 1Hz walk over
+// watchedChars), not here, so firstMove's zero point can trail the dismissal
+// by up to ACTIVE_POLL_INTERVAL.
+void H15ArmFirstMoveCheck(int gen, double dismissTime);
+#endif
+
 
 #endif // KENSHI_ZONE_OPT_TRACKING_H

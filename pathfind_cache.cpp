@@ -212,6 +212,19 @@ void SpcResetAll()
 
 void LogSquadPathCacheStats(double now)
 {
+#ifndef ZONEOPT_SQUAD_CACHE
+	// H5: the injection is compiled out of this build. Say so once instead of
+	// printing counters that can never move (squadPathCacheEnabled is a
+	// compile-time false here).
+	(void)now;
+	static bool loggedCompiledOut = false;
+	if (!loggedCompiledOut)
+	{
+		loggedCompiledOut = true;
+		LogMsg("[ZoneOpt] squadCache=compiled-out");
+	}
+	return;
+#else
 	if (!squadPathCacheEnabled)
 		return;
 
@@ -250,6 +263,7 @@ void LogSquadPathCacheStats(double now)
 	}
 
 	LogMsg(ss.str());
+#endif // ZONEOPT_SQUAD_CACHE
 }
 
 #endif // PATHFIND_STEP >= 4
